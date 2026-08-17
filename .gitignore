@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+service_account.json
+.env
+__pycache__/
+*.pyc
+.vscode/
+audits_json

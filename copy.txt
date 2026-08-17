@@ -1,0 +1,5 @@
+Connaught Place, Hauz Khas, Dwarka, Saket, Greater Kailash, Vasant Kunj, Lajpat Nagar, Karol Bagh, Rajouri Garden, Rohini, South Extension, Punjabi Bagh, Andheri, Bandra, Powai, Juhu, Colaba, Lower Parel, Borivali, Malad, Goregaon, Worli, Dadar, Churchgate, Koramangala, Indiranagar, Whitefield, HSR Layout, Jayanagar, Malleshwaram
+
+dentist,pediatrician, dermatologist,chartered accountant, tax consultant, advocate,law firm,real estate agent, property dealer, interior designer, architect,restaurant, cafe, bakery, caterer, banquet hall, gym, fitness center, yoga studio, salon, spa, beauty parlor,car repair, bike repair, car wash,laptop repair, mobile repair, travel agency, event planner, wedding planner, optician, diagnostic center, veterinary clinic, laundry service
+
+python -m streamlit run app.py
