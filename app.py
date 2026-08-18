@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-import google.auth.transport.requests
 import requests
 import urllib.parse
 import os
@@ -69,19 +68,16 @@ if not st.session_state.authenticated:
 # --- GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_gspread_client():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
     creds_dict = dict(st.secrets["gcp_service_account"])
     if "token_uri" not in creds_dict:
         creds_dict["token_uri"] = "https://oauth2.googleapis.com/token"
         
     credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    auth_req = google.auth.transport.requests.Request()
-    credentials.refresh(auth_req)
-
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {credentials.token}"})
-    client = gspread.Client(auth=credentials, session=session)
-    session._auth_request = auth_req
+    client = gspread.authorize(credentials)
     return client
 
 @st.cache_data(ttl=30)
@@ -122,7 +118,6 @@ def load_tab_data(sheet):
             seen_headers[h] = 0
             clean_headers.append(h)
 
-    # Track 1-based exact physical row positions on Google Sheet
     row_payloads = []
     for offset, r in enumerate(data_rows):
         if any(str(cell).strip() for cell in r):
@@ -143,9 +138,7 @@ def load_tab_data(sheet):
     if 'Record_Hash' not in df.columns or df['Record_Hash'].eq('').all():
         df['Record_Hash'] = [f"HASH_{i+1}" for i in range(len(df))]
 
-    # Reset index to guarantee clean positional alignment
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 def col_idx_to_a1(idx: int) -> str:
     letters = ""
@@ -265,7 +258,7 @@ if df_raw.empty and st.session_state.view != "analytics":
     st.warning(f"No records found in campaign tab '{selected_tab_name}'.")
     st.stop()
 
-# Scoring & Preparation with guaranteed row alignment
+# Scoring & Preparation with positional index reset
 if not df_raw.empty:
     scores_list = [engine.calculate_scores(row.to_dict()) for _, row in df_raw.iterrows()]
     scores_df = pd.DataFrame(scores_list, index=df_raw.index)
@@ -460,7 +453,6 @@ elif st.session_state.view == "database":
 
     if is_admin and not filtered_df.empty:
         with export_col:
-            # Exclude internal tracking row numbers from export
             export_data = filtered_df.drop(columns=['_sheet_row_num'], errors='ignore')
             csv_payload = export_data.to_csv(index=False).encode('utf-8')
             timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
@@ -785,6 +777,7 @@ elif st.session_state.view == "analytics" and is_admin:
 
     st.divider()
 
+    # Activity Timeline Feed
     st.markdown("#### Recent Team Activity Log")
     df_touched = df_claimed[df_claimed['last_contacted'] != ""].sort_values(by="last_contacted", ascending=False).head(15)
 
