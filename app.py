@@ -99,7 +99,7 @@ def load_tab_data(sheet):
 
     header_idx = 0
     known_headers = {'Record_Hash', 'Name', 'Phone_E164', 'Location', 'City', 'Website'}
-    for idx, row in enumerate(raw_rows[:10]):
+    for idx, row in enumerate(raw_rows[:15]):
         cleaned_row_cells = {str(cell).strip() for cell in row if str(cell).strip()}
         if known_headers.intersection(cleaned_row_cells):
             header_idx = idx
@@ -122,8 +122,19 @@ def load_tab_data(sheet):
             seen_headers[h] = 0
             clean_headers.append(h)
 
-    df = pd.DataFrame(data_rows, columns=clean_headers)
-    df = df.replace('', None).dropna(how='all').fillna('')
+    # Track 1-based exact physical row positions on Google Sheet
+    row_payloads = []
+    for offset, r in enumerate(data_rows):
+        if any(str(cell).strip() for cell in r):
+            actual_sheet_row = header_idx + 2 + offset
+            row_dict = {clean_headers[i]: r[i] if i < len(r) else "" for i in range(len(clean_headers))}
+            row_dict["_sheet_row_num"] = actual_sheet_row
+            row_payloads.append(row_dict)
+
+    if not row_payloads:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(row_payloads)
 
     for col in ['crm_status', 'notes', 'next_followup', 'last_contacted', 'assigned_to']:
         if col not in df.columns:
@@ -132,21 +143,18 @@ def load_tab_data(sheet):
     if 'Record_Hash' not in df.columns or df['Record_Hash'].eq('').all():
         df['Record_Hash'] = [f"HASH_{i+1}" for i in range(len(df))]
 
+    # Reset index to guarantee clean positional alignment
+    df = df.reset_index(drop=True)
     return df
 
 def col_idx_to_a1(idx: int) -> str:
-    """Converts a 1-based column index to spreadsheet letter (e.g. 1 -> A, 27 -> AA)."""
     letters = ""
     while idx > 0:
         idx, remainder = divmod(idx - 1, 26)
         letters = chr(65 + remainder) + letters
     return letters
 
-def update_lead_in_sheet(sheet, row_idx: int, update_dict: dict):
-    """
-    High-efficiency batch writer: Fetches and extends headers if missing, 
-    then writes the updated record in a single API call instead of cell-by-cell loops.
-    """
+def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
     headers = [str(h).strip() for h in sheet.row_values(1)]
     header_modified = False
 
@@ -159,10 +167,8 @@ def update_lead_in_sheet(sheet, row_idx: int, update_dict: dict):
         range_header = f"A1:{col_idx_to_a1(len(headers))}1"
         sheet.update(range_name=range_header, values=[headers])
 
-    sheet_row_num = row_idx + 2
-    current_row_values = sheet.row_values(sheet_row_num)
+    current_row_values = sheet.row_values(exact_sheet_row)
 
-    # Pad current values to match header length
     if len(current_row_values) < len(headers):
         current_row_values.extend([""] * (len(headers) - len(current_row_values)))
 
@@ -170,7 +176,7 @@ def update_lead_in_sheet(sheet, row_idx: int, update_dict: dict):
         col_pos = headers.index(key)
         current_row_values[col_pos] = str(val)
 
-    range_update = f"A{sheet_row_num}:{col_idx_to_a1(len(headers))}{sheet_row_num}"
+    range_update = f"A{exact_sheet_row}:{col_idx_to_a1(len(headers))}{exact_sheet_row}"
     sheet.update(range_name=range_update, values=[current_row_values])
 
 # Initialize UI session states
@@ -259,12 +265,14 @@ if df_raw.empty and st.session_state.view != "analytics":
     st.warning(f"No records found in campaign tab '{selected_tab_name}'.")
     st.stop()
 
-# Scoring & Preparation
+# Scoring & Preparation with guaranteed row alignment
 if not df_raw.empty:
     scores_list = [engine.calculate_scores(row.to_dict()) for _, row in df_raw.iterrows()]
-    scores_df = pd.DataFrame(scores_list)
+    scores_df = pd.DataFrame(scores_list, index=df_raw.index)
+    
     cols_to_drop = [c for c in ['opportunity_score', 'lead_tier', 'platinum_raw', 'priority_level', 'infra_deficiency', 'tracking_deficiency'] if c in df_raw.columns]
-    df_clean = df_raw.drop(columns=cols_to_drop)
+    df_clean = df_raw.drop(columns=cols_to_drop).reset_index(drop=True)
+    scores_df = scores_df.reset_index(drop=True)
     df_master = pd.concat([df_clean, scores_df], axis=1)
 else:
     df_master = pd.DataFrame()
@@ -298,7 +306,6 @@ if st.session_state.view == "dashboard":
         m3.metric("Follow-ups Due Today", len(due_today_pool))
         m4.metric("In-Outreach Active", len(df_master[df_master['crm_status'].str.upper().isin(['CONTACTED', 'CLAIMED', 'NO_ANSWER', 'FOLLOW-UP'])]))
         
-        # DUE TODAY CALLBACK QUEUE SUB-VIEW (ADMIN)
         if not due_today_pool.empty:
             with st.expander(f"Action Required: {len(due_today_pool)} Follow-Ups Due Today", expanded=True):
                 for idx, row in due_today_pool.iterrows():
@@ -340,7 +347,6 @@ if st.session_state.view == "dashboard":
         m2.metric("Follow-ups Due Today", len(my_due_today))
         m3.metric("Pending Calls", len(my_claimed[my_claimed['crm_status'].isin(['', 'NEW', 'CLAIMED'])]))
 
-        # DUE TODAY CALLBACK QUEUE SUB-VIEW (SALES REP)
         if not my_due_today.empty:
             with st.expander(f"Priority Callbacks: {len(my_due_today)} Scheduled for Today", expanded=True):
                 for idx, row in my_due_today.iterrows():
@@ -386,8 +392,8 @@ if st.session_state.view == "dashboard":
                             st.rerun()
                     else:
                         if c3.button("Claim Lead", key=f"claim_deck_{idx}", use_container_width=True):
-                            lead_row_idx = df_master[df_master['Record_Hash'] == row['Record_Hash']].index[0]
-                            update_lead_in_sheet(active_sheet, lead_row_idx, {
+                            sheet_row_num = int(row['_sheet_row_num'])
+                            update_lead_in_sheet(active_sheet, sheet_row_num, {
                                 'assigned_to': current_user, 
                                 'crm_status': 'CLAIMED'
                             })
@@ -452,10 +458,11 @@ elif st.session_state.view == "database":
     with head_count_col:
         st.markdown(f"**Records Displayed: {len(filtered_df)}**")
 
-    # CSV EXPORT ENGINE (ADMIN ONLY)
     if is_admin and not filtered_df.empty:
         with export_col:
-            csv_payload = filtered_df.to_csv(index=False).encode('utf-8')
+            # Exclude internal tracking row numbers from export
+            export_data = filtered_df.drop(columns=['_sheet_row_num'], errors='ignore')
+            csv_payload = export_data.to_csv(index=False).encode('utf-8')
             timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
             export_filename = f"leads_{selected_tab_name.lower().replace(' ', '_')}_{timestamp_str}.csv"
             st.download_button(
@@ -500,6 +507,7 @@ elif st.session_state.view == "lead_profile":
 
     lead_row_idx = lead_matches.index[0]
     lead = df_master.iloc[lead_row_idx].to_dict()
+    sheet_row_num = int(lead['_sheet_row_num'])
     assigned_rep = lead.get('assigned_to', '')
     is_claimed_by_me = (assigned_rep == current_user)
     is_unclaimed = (assigned_rep in ['', 'Unassigned', None])
@@ -521,7 +529,7 @@ elif st.session_state.view == "lead_profile":
         elif is_unclaimed:
             st.warning("Unclaimed Lead")
             if st.button("Claim This Lead Now", type="primary", use_container_width=True):
-                update_lead_in_sheet(active_sheet, lead_row_idx, {'assigned_to': current_user, 'crm_status': 'CLAIMED'})
+                update_lead_in_sheet(active_sheet, sheet_row_num, {'assigned_to': current_user, 'crm_status': 'CLAIMED'})
                 st.success("Lead claimed successfully.")
                 st.rerun()
         else:
@@ -627,7 +635,7 @@ elif st.session_state.view == "lead_profile":
             
             if q1.button("No Answer", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, lead_row_idx, {
+                update_lead_in_sheet(active_sheet, sheet_row_num, {
                     'crm_status': 'NO_ANSWER',
                     'notes': f"[{now_ts}] Called - No answer / Busy.",
                     'next_followup': next_date,
@@ -639,7 +647,7 @@ elif st.session_state.view == "lead_profile":
 
             if q2.button("Gatekeeper Refused", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=3)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, lead_row_idx, {
+                update_lead_in_sheet(active_sheet, sheet_row_num, {
                     'crm_status': 'GATEKEEPER_BLOCKED',
                     'notes': f"[{now_ts}] Reached reception/staff. Owner unavailable.",
                     'next_followup': next_date,
@@ -651,7 +659,7 @@ elif st.session_state.view == "lead_profile":
 
             if q3.button("Call Back Later", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, lead_row_idx, {
+                update_lead_in_sheet(active_sheet, sheet_row_num, {
                     'crm_status': 'FOLLOW-UP',
                     'notes': f"[{now_ts}] Requested callback.",
                     'next_followup': next_date,
@@ -664,7 +672,7 @@ elif st.session_state.view == "lead_profile":
             q4, q5 = st.columns(2)
             if q4.button("Meeting / Demo Booked", type="primary", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, lead_row_idx, {
+                update_lead_in_sheet(active_sheet, sheet_row_num, {
                     'crm_status': 'INTERESTED',
                     'notes': f"[{now_ts}] Meeting / Demo pitch scheduled.",
                     'next_followup': next_date,
@@ -675,7 +683,7 @@ elif st.session_state.view == "lead_profile":
                 st.rerun()
 
             if q5.button("Not Interested / Lost", use_container_width=True):
-                update_lead_in_sheet(active_sheet, lead_row_idx, {
+                update_lead_in_sheet(active_sheet, sheet_row_num, {
                     'crm_status': 'LOST',
                     'notes': f"[{now_ts}] Lead declined offer.",
                     'last_contacted': now_ts,
@@ -704,7 +712,7 @@ elif st.session_state.view == "lead_profile":
                     'last_contacted': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                     'assigned_to': current_user if is_unclaimed else assigned_rep
                 }
-                update_lead_in_sheet(active_sheet, lead_row_idx, update_dict)
+                update_lead_in_sheet(active_sheet, sheet_row_num, update_dict)
                 st.success("Activity saved.")
                 st.rerun()
 
@@ -777,7 +785,6 @@ elif st.session_state.view == "analytics" and is_admin:
 
     st.divider()
 
-    # Activity Timeline Feed
     st.markdown("#### Recent Team Activity Log")
     df_touched = df_claimed[df_claimed['last_contacted'] != ""].sort_values(by="last_contacted", ascending=False).head(15)
 

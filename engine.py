@@ -42,7 +42,7 @@ class SalesIntelligenceEngine:
 
         platinum_deficiency = 100 - min(max(raw_platinum, 0), 100)
 
-        if infra == "NO_WEBSITE" or not website:
+        if infra == "NO_WEBSITE" or not website or website.upper() in {"NONE", "NULL", "N/A", "NAN"}:
             infra_deficiency = 100
         elif any(legacy in tech_stack for legacy in cls.LEGACY_STACKS):
             infra_deficiency = 60
@@ -51,7 +51,7 @@ class SalesIntelligenceEngine:
         else:
             infra_deficiency = 50
 
-        if pixels in {"NONE", "", "NULL", "FALSE"}:
+        if pixels in {"NONE", "", "NULL", "FALSE", "NAN", "N/A"}:
             tracking_deficiency = 100
         else:
             tracking_deficiency = 20
@@ -93,12 +93,12 @@ class SalesIntelligenceEngine:
     @classmethod
     def generate_sales_brief(cls, row: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Synthesizes deep commercial intel, revenue leaks, customer pain points,
+        Synthesizes commercial intel, revenue leaks, customer pain points,
         recommended pricing/packages, and pitch angles for the salesperson.
         """
         infra = cls._parse_str(row.get("Infra_Classification"), "").upper()
-        tech_stack = cls._parse_str(row.get("CMS_Tech_Stack"), "None")
-        pixels = cls._parse_str(row.get("Pixels_Tracked"), "None")
+        tech_stack_raw = cls._parse_str(row.get("CMS_Tech_Stack"), "None")
+        pixels_raw = cls._parse_str(row.get("Pixels_Tracked"), "None")
         website = cls._parse_str(row.get("Website"), "")
         business_name = cls._parse_str(row.get("Name"), "this business")
         city = cls._parse_str(row.get("City"), "your area")
@@ -106,14 +106,23 @@ class SalesIntelligenceEngine:
         network = cls._parse_str(row.get("Network_Footprint"), "Single Location")
         entity_type = cls._parse_str(row.get("Entity_Resolution_Type"), "Independent")
 
-        has_no_website = (infra == "NO_WEBSITE" or not website or website == "None")
-        has_no_pixels = (pixels in {"NONE", "", "NULL", "None", "False"})
-        has_no_stack = (tech_stack in {"NONE", "", "NULL", "None", "None/Custom"})
+        # Normalize comparisons to uppercase
+        pixels_upper = pixels_raw.upper()
+        tech_stack_upper = tech_stack_raw.upper()
+        website_upper = website.upper()
+
+        has_no_website = (
+            infra == "NO_WEBSITE" 
+            or not website 
+            or website_upper in {"NONE", "NULL", "N/A", "NAN"}
+        )
+        has_no_pixels = pixels_upper in {"NONE", "", "NULL", "FALSE", "NAN", "N/A"}
+        has_no_stack = tech_stack_upper in {"NONE", "", "NULL", "NONE/CUSTOM", "NAN", "N/A"}
 
         # 1. Identify Core Business Scenario
         if has_no_website:
             scenario = "NO_DIGITAL_ASSET"
-            category_title = "Zero Digital Asset - Complete Aggregator Dependency"
+            category_title = "Zero Digital Asset — Complete Aggregator Dependency"
             pain_points = [
                 f"{business_name} does not own a dedicated web platform, forcing 100% of online discovery through aggregators, social media, or Google Maps.",
                 "Zero automated booking/inquiry funnel: potential clients looking up their brand cannot convert directly after hours.",
@@ -132,7 +141,7 @@ class SalesIntelligenceEngine:
 
         elif has_no_pixels and has_no_stack:
             scenario = "STATIC_UNTRACKED_SITE"
-            category_title = "Dormant Web Presence - Active Traffic & Revenue Leak"
+            category_title = "Dormant Web Presence — Active Traffic & Revenue Leak"
             pain_points = [
                 f"{business_name} has an active web domain ({website}), but it lacks tracking tags, analytics, and dynamic conversion funnels.",
                 "100% Retargeting Blindspot: Over 90% of visitors who leave without booking can never be remarketed or recaptured.",
@@ -151,9 +160,9 @@ class SalesIntelligenceEngine:
 
         else:
             scenario = "OPTIMIZATION_READY"
-            category_title = "Established Stack - Speed & Local SEO Domination"
+            category_title = "Established Stack — Speed & Local SEO Domination"
             pain_points = [
-                f"Existing web stack ({tech_stack}) requires optimization to maintain search dominance against aggressive local competitors in {location}.",
+                f"Existing web stack ({tech_stack_raw}) requires optimization to maintain search dominance against aggressive local competitors in {location}.",
                 "Mobile page speed bottlenecks and non-optimized assets increase bounce rates during peak search hours.",
                 "Local SEO gaps prevent the business from dominating the 'Near Me' top 3 map pack positions."
             ]
@@ -203,7 +212,7 @@ class SalesIntelligenceEngine:
         cat = category or "business"
         loc = location or "your area"
 
-        if pitch_type == "NO_ASSET" or pitch_type == "NO_DIGITAL_ASSET":
+        if pitch_type in {"NO_ASSET", "NO_DIGITAL_ASSET"}:
             text = (
                 f"Hello {biz} team, I was reviewing leading {cat}s in {loc} and noticed "
                 f"you currently operate without an owned digital web platform. You are losing "
@@ -211,7 +220,7 @@ class SalesIntelligenceEngine:
                 f"high-converting web platforms that secure direct bookings. Open to a 2-minute overview?"
             )
             script = "Focus on asset ownership, zero commissions, and customer database control."
-        elif pitch_type == "STATIC_UNTRACKED_SITE" or pitch_type == "CONVERSION_LEAK":
+        elif pitch_type in {"STATIC_UNTRACKED_SITE", "CONVERSION_LEAK"}:
             text = (
                 f"Hello {biz} team, during a technical audit of {cat}s in {loc}, we noticed "
                 f"your website lacks active retargeting and conversion capture tags. You are paying for "
