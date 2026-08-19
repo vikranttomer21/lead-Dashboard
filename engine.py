@@ -1,20 +1,13 @@
 import urllib.parse
+import re
 from typing import Dict, Any, List, Tuple
 
 
 class SalesIntelligenceEngine:
     """
-    Enterprise sales analytics engine that translates technical gaps 
-    into commercial value propositions, objection handling, and pitch packages.
+    Translates raw technical audit data into simple, actionable, 
+    and punchy sales cheat-sheets for outreach reps.
     """
-
-    WEIGHT_PLATINUM_DEFICIENCY = 0.50
-    WEIGHT_INFRASTRUCTURE = 0.25
-    WEIGHT_ANALYTICS_TRACKING = 0.15
-    WEIGHT_NETWORK_FOOTPRINT = 0.10
-
-    MODERN_STACKS = {"NEXTJS", "REACT", "SHOPIFY", "WEBFLOW", "GATSBY", "ASTRO", "WORDPRESS"}
-    LEGACY_STACKS = {"WIX", "SQUARESPACE", "JOOMLA", "DRUPAL", "PHP", "STATIC HTML"}
 
     @classmethod
     def _parse_int(cls, val: Any, default: int = 0) -> int:
@@ -34,208 +27,144 @@ class SalesIntelligenceEngine:
     @classmethod
     def calculate_scores(cls, row: Dict[str, Any]) -> Dict[str, Any]:
         raw_platinum = cls._parse_int(row.get("Platinum_Score"), 0)
-        infra = cls._parse_str(row.get("Infra_Classification"), "").upper()
-        website = cls._parse_str(row.get("Website"), "")
-        tech_stack = cls._parse_str(row.get("CMS_Tech_Stack"), "").upper()
-        pixels = cls._parse_str(row.get("Pixels_Tracked"), "").upper()
-        network = cls._parse_str(row.get("Network_Footprint"), "").upper()
+        scraped_tier = cls._parse_str(row.get("Lead_Tier"), "")
 
-        platinum_deficiency = 100 - min(max(raw_platinum, 0), 100)
-
-        if infra == "NO_WEBSITE" or not website or website.upper() in {"NONE", "NULL", "N/A", "NAN"}:
-            infra_deficiency = 100
-        elif any(legacy in tech_stack for legacy in cls.LEGACY_STACKS):
-            infra_deficiency = 60
-        elif any(modern in tech_stack for modern in cls.MODERN_STACKS):
-            infra_deficiency = 20
+        if raw_platinum == 0:
+            opportunity_score = 95
         else:
-            infra_deficiency = 50
+            opportunity_score = max(10, 100 - raw_platinum)
 
-        if pixels in {"NONE", "", "NULL", "FALSE", "NAN", "N/A"}:
-            tracking_deficiency = 100
-        else:
-            tracking_deficiency = 20
-
-        if "CHAIN" in network or "MULTI" in network:
-            footprint_factor = 90
-        elif "SINGLE" in network or "FLAGSHIP" in network:
-            footprint_factor = 75
-        else:
-            footprint_factor = 60
-
-        opportunity_score = round(
-            (platinum_deficiency * cls.WEIGHT_PLATINUM_DEFICIENCY)
-            + (infra_deficiency * cls.WEIGHT_INFRASTRUCTURE)
-            + (tracking_deficiency * cls.WEIGHT_ANALYTICS_TRACKING)
-            + (footprint_factor * cls.WEIGHT_NETWORK_FOOTPRINT)
-        )
-        opportunity_score = min(max(opportunity_score, 0), 100)
-
-        if opportunity_score >= 85:
-            lead_tier = "Tier 1 (High Opportunity)"
+        if opportunity_score >= 80:
+            calculated_tier = "Tier 1 (High Priority Lead)"
             priority_level = "CRITICAL"
-        elif opportunity_score >= 70:
-            lead_tier = "Tier 2 (Medium Opportunity)"
+        elif opportunity_score >= 60:
+            calculated_tier = "Tier 2 (Medium Opportunity)"
             priority_level = "ELEVATED"
         else:
-            lead_tier = "Tier 3 (Standard)"
+            calculated_tier = "Tier 3 (Local SEO / Optimization)"
             priority_level = "STANDARD"
 
         return {
             "platinum_raw": raw_platinum,
             "opportunity_score": opportunity_score,
-            "lead_tier": lead_tier,
+            "lead_tier": scraped_tier if scraped_tier else calculated_tier,
             "priority_level": priority_level,
-            "infra_deficiency": infra_deficiency,
-            "tracking_deficiency": tracking_deficiency,
         }
 
     @classmethod
+    def _simplify_trigger_text(cls, trigger: str, business_name: str, location: str) -> str:
+        """Converts raw technical audit text into clear sales-friendly bullet points."""
+        t = trigger.lower().strip()
+
+        if "instagram" in t or "social" in t or "facebook" in t or "linktr.ee" in t:
+            return "Sending customers to Instagram/Social bio instead of an instant direct booking page."
+        if "pixel" in t or "retarget" in t:
+            return "Lost visitors: People who click their link and bounce can never be brought back with ads."
+        if "no website" in t or "lacks a digital website" in t or "no asset" in t:
+            return "No official website: 100% reliant on word-of-mouth or third-party apps."
+        if "commission" in t or "zomato" in t or "swiggy" in t or "magicpin" in t:
+            return "Paying heavy 15-30% aggregator commissions on orders they could capture directly."
+        if "schema" in t or "json-ld" in t or "google 3-pack" in t or "local seo" in t:
+            return f"Losing local Google rankings: Nearby competitors show up above them on Google Maps in {location}."
+        if "timed out" in t or "ssl" in t or "broken" in t or "dns" in t:
+            return "Website is down or showing security errors, losing customer trust immediately."
+        if "slow" in t or "latency" in t:
+            return "Slow mobile loading speed: Mobile users leave before the page even finishes loading."
+        if "call" in t or "cta" in t or "above-the-fold" in t:
+            return "No instant 'Call Now' or 'Order on WhatsApp' button visible when customers open the link."
+        if "subdomain" in t or "grexa" in t or "wixsite" in t:
+            return "Using an unbranded free web link, which looks unprofessional to high-paying customers."
+        
+        return trigger.strip()
+
+    @classmethod
     def generate_sales_brief(cls, row: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Synthesizes commercial intel, revenue leaks, customer pain points,
-        recommended pricing/packages, and pitch angles for the salesperson.
-        """
-        infra = cls._parse_str(row.get("Infra_Classification"), "").upper()
-        tech_stack_raw = cls._parse_str(row.get("CMS_Tech_Stack"), "None")
-        pixels_raw = cls._parse_str(row.get("Pixels_Tracked"), "None")
-        website = cls._parse_str(row.get("Website"), "")
         business_name = cls._parse_str(row.get("Name"), "this business")
         city = cls._parse_str(row.get("City"), "your area")
         location = cls._parse_str(row.get("Location"), city)
         network = cls._parse_str(row.get("Network_Footprint"), "Single Location")
         entity_type = cls._parse_str(row.get("Entity_Resolution_Type"), "Independent")
 
-        # Normalize comparisons to uppercase
-        pixels_upper = pixels_raw.upper()
-        tech_stack_upper = tech_stack_raw.upper()
-        website_upper = website.upper()
+        # Direct Scraped copy
+        scraped_tier = cls._parse_str(row.get("Lead_Tier"), "Standard Digital Profile")
+        scraped_triggers = cls._parse_str(row.get("Audit_Triggers"), "")
+        scraped_pitch = cls._parse_str(row.get("Primary_Pitch_Strategy"), "")
+        scraped_pain = cls._parse_str(row.get("Client_Pain_Point"), "")
+        scraped_wa_hook = cls._parse_str(row.get("WhatsApp_DM_Hook"), "")
 
-        has_no_website = (
-            infra == "NO_WEBSITE" 
-            or not website 
-            or website_upper in {"NONE", "NULL", "N/A", "NAN"}
-        )
-        has_no_pixels = pixels_upper in {"NONE", "", "NULL", "FALSE", "NAN", "N/A"}
-        has_no_stack = tech_stack_upper in {"NONE", "", "NULL", "NONE/CUSTOM", "NAN", "N/A"}
-
-        # 1. Identify Core Business Scenario
-        if has_no_website:
-            scenario = "NO_DIGITAL_ASSET"
-            category_title = "Zero Digital Asset — Complete Aggregator Dependency"
-            pain_points = [
-                f"{business_name} does not own a dedicated web platform, forcing 100% of online discovery through aggregators, social media, or Google Maps.",
-                "Zero automated booking/inquiry funnel: potential clients looking up their brand cannot convert directly after hours.",
-                "High customer acquisition costs: paying intermediary platform fees/commissions instead of building brand equity.",
-                "Competitor vulnerability: nearby competitors with dedicated websites are ranking higher and capturing their high-ticket direct clients."
-            ]
-            package_name = "Turnkey Direct-Client Acquisition Platform"
-            package_scope = [
-                "Custom High-Converting Mobile-First Web Platform (Next.js / Webflow)",
-                "Instant WhatsApp & One-Click Direct Booking Funnel",
-                "Google Business Profile (GMB) Integration & Local SEO Synchronization",
-                "Automated Review Collection & Trust Engine"
-            ]
-            pitch_angle = "Focus on asset ownership, bypassing commission cuts, and converting mobile map searchers into direct scheduled clients."
-            closer_hook = f"We build an automated conversion hub for {business_name} so you never lose high-ticket clients to aggregators or local competitors."
-
-        elif has_no_pixels and has_no_stack:
-            scenario = "STATIC_UNTRACKED_SITE"
-            category_title = "Dormant Web Presence — Active Traffic & Revenue Leak"
-            pain_points = [
-                f"{business_name} has an active web domain ({website}), but it lacks tracking tags, analytics, and dynamic conversion funnels.",
-                "100% Retargeting Blindspot: Over 90% of visitors who leave without booking can never be remarketed or recaptured.",
-                "No lead capture infrastructure: site acts as an online brochure rather than an active booking engine.",
-                "Zero data attribution: the owner has no visibility into where their highest-paying clients originate."
-            ]
-            package_name = "Full-Funnel Conversion Engine & Retargeting Setup"
-            package_scope = [
-                "Meta Pixel & Google Tag Manager Installation with Custom Event Triggers",
-                "Conversion-Focused Landing Page Redesign with Sticky CTA/WhatsApp Hooks",
-                "Automated Visitor Recapture & Abandoned Lead Nurturing System",
-                "Local Keyword Schema Markup to Boost Ranking in Organic Mobile Search"
-            ]
-            pitch_angle = "Explain that their current site is bleeding 90% of incoming visitors. Pitch installing conversion tracking and lead capture mechanics."
-            closer_hook = f"You are already getting traffic to {website}, but without tracking and quick-booking hooks, you are paying to educate visitors who end up booking elsewhere."
-
+        # 1. Translate Pain Points / Leaks into Plain English
+        simplified_pain_points = []
+        if scraped_triggers:
+            for raw_t in scraped_triggers.split("|"):
+                if raw_t.strip():
+                    simplified_pain_points.append(
+                        cls._simplify_trigger_text(raw_t, business_name, location)
+                    )
+        elif scraped_pain:
+            simplified_pain_points.append(cls._simplify_trigger_text(scraped_pain, business_name, location))
         else:
-            scenario = "OPTIMIZATION_READY"
-            category_title = "Established Stack — Speed & Local SEO Domination"
-            pain_points = [
-                f"Existing web stack ({tech_stack_raw}) requires optimization to maintain search dominance against aggressive local competitors in {location}.",
-                "Mobile page speed bottlenecks and non-optimized assets increase bounce rates during peak search hours.",
-                "Local SEO gaps prevent the business from dominating the 'Near Me' top 3 map pack positions."
-            ]
-            package_name = "Local Market Domination & Speed Architecture"
-            package_scope = [
-                "Core Web Vitals & Mobile Speed Optimization",
-                "Local Citation & Local SEO Map Pack Domination Package",
-                "Retargeting Campaign Setup for Warm Web Visitors",
-                "Conversion Funnel A/B Testing on Mobile Booking Forms"
-            ]
-            pitch_angle = "Pitch enterprise speed, outranking direct local competitors, and doubling mobile form completions."
-            closer_hook = f"Your brand is established, but optimizing your mobile loading speed and local search pack will put you at #1 across {location}."
+            simplified_pain_points.append(f"Customer drop-offs and missing instant booking buttons on mobile.")
 
-        # 2. Objection Handling Matrix
+        # 2. Translate What to Sell (Package Scope) into Clear Deliverables
+        package_name = scraped_pitch or "Turnkey Direct-Customer Acquisition Hub"
+        package_scope = [
+            "⚡ Fast Mobile-Friendly Storefront (Loads in under 1 second)",
+            "📲 Instant 1-Click WhatsApp Ordering & Table Reservation System",
+            "📍 Google Maps & Local Search Setup (Rank #1 in your local area)",
+            "⭐ Automated 5-Star Customer Review Collector"
+        ]
+
+        # 3. Simple Core Pitch Angle (What the salesperson should say)
+        if "social" in scraped_tier.lower() or "instagram" in str(simplified_pain_points).lower():
+            closer_hook = f"When customers look up {business_name}, sending them to an Instagram link loses orders. A dedicated 1-click WhatsApp storefront captures direct customers instantly without aggregator cuts."
+        elif "broken" in scraped_tier.lower() or "broken" in str(simplified_pain_points).lower():
+            closer_hook = f"{business_name}'s website is currently unreachable or slow. We can restore a lightning-fast cloud web platform in 24 hours so you never miss another customer inquiry."
+        elif "commission" in scraped_tier.lower() or "aggregator" in str(simplified_pain_points).lower():
+            closer_hook = f"{business_name} is sending its best direct traffic to food aggregators and paying 15–30% in fees. We install a zero-commission direct ordering system that keeps 100% of the profits."
+        else:
+            closer_hook = f"Position {business_name} as the top-ranking choice in {location} with automated booking and local Google Maps optimization."
+
+        # 4. Realistic Everyday Sales Objections & Comebacks
         objections = [
             {
-                "objection": "We already get enough clients from word of mouth.",
-                "rebuttal": f"Word of mouth is great, but when those referrals Google '{business_name}' to check hours or pricing, they need an instant direct booking interface. Without it, competitors sitting on top of search ads pick them off."
+                "objection": "We already get enough business through word-of-mouth or Instagram.",
+                "rebuttal": f"Word-of-mouth is great, but when those referrals search '{business_name}' on their phone to check menu prices or book a table, an Instagram bio link creates friction. A 1-click WhatsApp direct checkout converts them in 5 seconds before they go to a competitor."
             },
             {
-                "objection": "We already have a website / social media page.",
-                "rebuttal": "Social pages keep users trapped in that social platform. An owned conversion platform captures direct phone numbers, enables retargeting, and builds your private customer database."
+                "objection": "We are already listed on Zomato / Swiggy / Google Maps.",
+                "rebuttal": "Aggregators take up to 25–30% of your bill and list your competitors right next to your menu. Having your own direct link means zero commissions and you own the customer's phone number forever."
             },
             {
-                "objection": "Send me a proposal on WhatsApp/Email.",
-                "rebuttal": f"I can send that right over. To ensure I include the exact numbers for {location}, are you primarily looking to capture new patient/client inquiries or optimize your current follow-up flow?"
+                "objection": "Send me the details on WhatsApp first.",
+                "rebuttal": f"Sending the 60-second scorecard right away! Before I send it, are you looking primarily to cut third-party commission costs or get more direct table bookings in {location}?"
             }
         ]
 
         return {
-            "scenario": scenario,
-            "category_title": category_title,
-            "pain_points": pain_points,
+            "category_title": scraped_tier,
+            "pain_points": simplified_pain_points,
             "package_name": package_name,
             "package_scope": package_scope,
-            "pitch_angle": pitch_angle,
             "closer_hook": closer_hook,
             "objections": objections,
-            "network_scope": f"{network} ({entity_type})"
+            "network_scope": f"{network} ({entity_type})",
+            "whatsapp_dm_hook": scraped_wa_hook
         }
 
     @classmethod
     def get_outreach_pitch(
-        cls, pitch_type: str, business_name: str, category: str, location: str
+        cls, business_name: str, category: str, location: str, pitch_type: str = "GENERAL"
     ) -> Tuple[str, str, str]:
         biz = business_name or "there"
-        cat = category or "business"
+        cat = category or "outlet"
         loc = location or "your area"
 
-        if pitch_type in {"NO_ASSET", "NO_DIGITAL_ASSET"}:
-            text = (
-                f"Hello {biz} team, I was reviewing leading {cat}s in {loc} and noticed "
-                f"you currently operate without an owned digital web platform. You are losing "
-                f"high-intent direct searches to competitors and aggregators. We build automated, "
-                f"high-converting web platforms that secure direct bookings. Open to a 2-minute overview?"
-            )
-            script = "Focus on asset ownership, zero commissions, and customer database control."
-        elif pitch_type in {"STATIC_UNTRACKED_SITE", "CONVERSION_LEAK"}:
-            text = (
-                f"Hello {biz} team, during a technical audit of {cat}s in {loc}, we noticed "
-                f"your website lacks active retargeting and conversion capture tags. You are paying for "
-                f"or attracting traffic that leaves without converting. We deploy a turnkey tracking fix "
-                f"that recaptures drop-offs. Would you like the audit breakdown?"
-            )
-            script = "Focus on paid/organic visitor recapture, tracking attribution, and ROI recovery."
-        else:
-            text = (
-                f"Hello {biz} team, we conducted a market scan of {cat}s in {loc} and identified "
-                f"specific mobile speed and search ranking bottlenecks holding your site back from dominating local search. "
-                f"We help local market leaders capture the top 3 Google positions. Open to seeing the diagnostic?"
-            )
-            script = "Focus on local search domination, page speed benchmarks, and competitive displacement."
-
+        text = (
+            f"Hey {biz} team, noticed your profile while auditing top {cat}s in {loc}. "
+            f"Spotted a couple of quick conversion leaks on your mobile link that cost direct customer orders. "
+            f"We have a 60-second fix that sets up instant direct WhatsApp ordering—open to taking a quick look?"
+        )
+        script = "Focus on direct WhatsApp bookings, zero commissions, and owning customer data."
         encoded = urllib.parse.quote(text)
         return text, script, encoded
 

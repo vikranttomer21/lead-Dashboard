@@ -2,15 +2,15 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-import requests
 import urllib.parse
 import os
 import datetime
+import re
 import engine
 
 st.set_page_config(page_title="Sales Intelligence CRM", layout="wide")
 
-# Custom Clean Professional Styling
+# Styling
 st.markdown("""
 <style>
     .metric-card {
@@ -66,7 +66,6 @@ if not st.session_state.authenticated:
     st.stop()
 
 # --- GOOGLE SHEETS CONNECTION ---
-@st.cache_resource
 def get_gspread_client():
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -77,10 +76,8 @@ def get_gspread_client():
         creds_dict["token_uri"] = "https://oauth2.googleapis.com/token"
         
     credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    client = gspread.authorize(credentials)
-    return client
+    return gspread.authorize(credentials)
 
-@st.cache_data(ttl=30)
 def get_all_worksheets():
     client = get_gspread_client()
     sheet_url = st.secrets["spreadsheet"]["sheet_url"]
@@ -88,64 +85,106 @@ def get_all_worksheets():
     worksheets = {ws.title.strip(): ws for ws in spreadsheet.worksheets()}
     return worksheets, spreadsheet
 
-def load_tab_data(sheet):
-    raw_rows = sheet.get_all_values()
-    if not raw_rows or len(raw_rows) < 2:
-        return pd.DataFrame()
-
-    header_idx = 0
-    known_headers = {'Record_Hash', 'Name', 'Phone_E164', 'Location', 'City', 'Website'}
-    for idx, row in enumerate(raw_rows[:15]):
-        cleaned_row_cells = {str(cell).strip() for cell in row if str(cell).strip()}
-        if known_headers.intersection(cleaned_row_cells):
-            header_idx = idx
-            break
-
-    headers = [str(h).strip() for h in raw_rows[header_idx]]
-    data_rows = raw_rows[header_idx + 1:]
-    if not data_rows:
-        return pd.DataFrame()
-
-    seen_headers = {}
-    clean_headers = []
-    for i, h in enumerate(headers):
-        if not h:
-            h = f"Column_{i+1}"
-        if h in seen_headers:
-            seen_headers[h] += 1
-            clean_headers.append(f"{h}_{seen_headers[h]}")
-        else:
-            seen_headers[h] = 0
-            clean_headers.append(h)
-
-    row_payloads = []
-    for offset, r in enumerate(data_rows):
-        if any(str(cell).strip() for cell in r):
-            actual_sheet_row = header_idx + 2 + offset
-            row_dict = {clean_headers[i]: r[i] if i < len(r) else "" for i in range(len(clean_headers))}
-            row_dict["_sheet_row_num"] = actual_sheet_row
-            row_payloads.append(row_dict)
-
-    if not row_payloads:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(row_payloads)
-
-    for col in ['crm_status', 'notes', 'next_followup', 'last_contacted', 'assigned_to']:
-        if col not in df.columns:
-            df[col] = ""
-
-    if 'Record_Hash' not in df.columns or df['Record_Hash'].eq('').all():
-        df['Record_Hash'] = [f"HASH_{i+1}" for i in range(len(df))]
-
-    return df.reset_index(drop=True)
-
 def col_idx_to_a1(idx: int) -> str:
     letters = ""
     while idx > 0:
         idx, remainder = divmod(idx - 1, 26)
         letters = chr(65 + remainder) + letters
     return letters
+
+def load_tab_data(sheet, tab_name: str):
+    """
+    Direct Header-Zip: Zips Row 1 headers with each row cell, preventing offset shifts.
+    """
+    raw_rows = sheet.get_all_values()
+    if not raw_rows or len(raw_rows) < 2:
+        return pd.DataFrame()
+
+    header_row_idx = 0
+    for idx, r in enumerate(raw_rows[:5]):
+        cleaned = [str(c).strip().lower() for c in r if str(c).strip()]
+        if any(k in cleaned for k in ['name', 'phone_e164', 'phone', 'record_hash', 'city']):
+            header_row_idx = idx
+            break
+
+    headers = [str(h).strip() for h in raw_rows[header_row_idx]]
+    num_cols = len(headers)
+    data_rows = raw_rows[header_row_idx + 1:]
+
+    records = []
+    for offset, r in enumerate(data_rows):
+        if not any(str(c).strip() for c in r):
+            continue
+
+        actual_sheet_row = header_row_idx + 2 + offset
+        padded_row = r + [""] * (num_cols - len(r))
+        row_raw = {headers[i]: str(padded_row[i]).strip() for i in range(num_cols) if headers[i]}
+
+        def get_field(*possible_names, default=""):
+            for name in possible_names:
+                for k, v in row_raw.items():
+                    if k.lower() == name.lower() and v:
+                        return v
+            return default
+
+        # Clean Phone Number directly from Phone_E164
+        phone_raw = get_field('Phone_E164', 'Phone', 'phone', 'Contact', default="")
+        phone_cleaned = re.sub(r'[^\d+]', '', phone_raw)
+        wa_link = get_field('WhatsApp_Click_Link', 'whatsapp_click_link', 'wa_link', default="")
+        
+        # Only fall back to extracting from WhatsApp Link if phone is truly empty
+        if not phone_cleaned and "wa.me/" in wa_link:
+            m = re.search(r'wa\.me/(\d+)', wa_link)
+            if m:
+                phone_cleaned = m.group(1)
+
+        unique_key = f"{tab_name}::{actual_sheet_row}"
+
+        row_dict = {
+            "_lead_unique_key": unique_key,
+            "_sheet_row_num": actual_sheet_row,
+            "_sheet_tab_name": tab_name,
+            "Record_Hash": get_field('Record_Hash', 'record_hash', default=f"HASH_{actual_sheet_row}"),
+            "Lead_Tier": get_field('Lead_Tier', 'lead_tier', default=""),
+            "Platinum_Score": get_field('Platinum_Score', 'platinum_score', default="0"),
+            "Name": get_field('Name', 'Business_Name', 'name', default=f"Business @ Row {actual_sheet_row}"),
+            "Location": get_field('Location', 'Address', 'locality', default=""),
+            "City": get_field('City', 'city', default=""),
+            "Phone_E164": phone_cleaned,
+            "WhatsApp_Click_Link": wa_link,
+            "Website": get_field('Website', 'website', 'Domain', default=""),
+            "Infra_Classification": get_field('Infra_Classification', 'infra_classification', default="NO_WEBSITE"),
+            "CMS_Tech_Stack": get_field('CMS_Tech_Stack', 'cms_tech_stack', default="None"),
+            "Pixels_Tracked": get_field('Pixels_Tracked', 'pixels_tracked', default="None"),
+            "Network_Footprint": get_field('Network_Footprint', 'network_footprint', default="Single Location"),
+            "Entity_Resolution_Type": get_field('Entity_Resolution_Type', 'entity_resolution_type', default="Independent"),
+            
+            # Scraped Rich Copy
+            "Audit_Triggers": get_field('Audit_Triggers', 'audit_triggers', default=""),
+            "Primary_Pitch_Strategy": get_field('Primary_Pitch_Strategy', 'primary_pitch_strategy', default=""),
+            "Client_Pain_Point": get_field('Client_Pain_Point', 'client_pain_point', default=""),
+            "WhatsApp_DM_Hook": get_field('WhatsApp_DM_Hook', 'whatsapp_dm_hook', default=""),
+            "Value_First_Audit_Hook": get_field('Value_First_Audit_Hook', 'value_first_audit_hook', default=""),
+            "Competitor_Comparison_Hook": get_field('Competitor_Comparison_Hook', 'competitor_comparison_hook', default=""),
+            "HTML_Scorecard_File": get_field('HTML_Scorecard_File', 'html_scorecard_file', default=""),
+            
+            # CRM Fields
+            "crm_status": get_field('crm_status', default=""),
+            "notes": get_field('notes', default=""),
+            "next_followup": get_field('next_followup', default=""),
+            "last_contacted": get_field('last_contacted', default=""),
+            "assigned_to": get_field('assigned_to', default=""),
+        }
+
+        # Calculate opportunity score
+        scores = engine.calculate_scores(row_dict)
+        row_dict.update(scores)
+        records.append(row_dict)
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records).reset_index(drop=True)
 
 def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
     headers = [str(h).strip() for h in sheet.row_values(1)]
@@ -161,24 +200,26 @@ def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
         sheet.update(range_name=range_header, values=[headers])
 
     current_row_values = sheet.row_values(exact_sheet_row)
-
     if len(current_row_values) < len(headers):
         current_row_values.extend([""] * (len(headers) - len(current_row_values)))
 
     for key, val in update_dict.items():
-        col_pos = headers.index(key)
-        current_row_values[col_pos] = str(val)
+        if key in headers:
+            col_pos = headers.index(key)
+            current_row_values[col_pos] = str(val)
 
     range_update = f"A{exact_sheet_row}:{col_idx_to_a1(len(headers))}{exact_sheet_row}"
     sheet.update(range_name=range_update, values=[current_row_values])
 
-# Initialize UI session states
+# Session state initialization
 if "view" not in st.session_state:
     st.session_state.view = "dashboard"
-if "selected_lead_id" not in st.session_state:
-    st.session_state.selected_lead_id = None
-if "assigned_batch_hashes" not in st.session_state:
-    st.session_state.assigned_batch_hashes = []
+if "selected_lead_name" not in st.session_state:
+    st.session_state.selected_lead_name = None
+if "selected_lead_hash" not in st.session_state:
+    st.session_state.selected_lead_hash = None
+if "assigned_batch_keys" not in st.session_state:
+    st.session_state.assigned_batch_keys = []
 
 try:
     worksheets_dict, spreadsheet = get_all_worksheets()
@@ -186,14 +227,16 @@ except Exception as e:
     st.error(f"Failed to connect to Google Sheets: {e}")
     st.stop()
 
-# --- SIDEBAR (USER PROFILE & LOGOUT) ---
+# --- SIDEBAR ---
 st.sidebar.markdown(f"**User:** {st.session_state.user_display_name}")
 st.sidebar.caption(f"Role: **{st.session_state.user_role.upper()}**")
 
 if st.sidebar.button("Log Out", use_container_width=True):
     st.session_state.authenticated = False
     st.session_state.username = None
-    st.session_state.assigned_batch_hashes = []
+    st.session_state.selected_lead_name = None
+    st.session_state.selected_lead_hash = None
+    st.session_state.assigned_batch_keys = []
     st.rerun()
 
 st.sidebar.divider()
@@ -210,10 +253,11 @@ else:
 with col_nav1:
     st.markdown("### Lead Intelligence & Outreach")
 
-def reset_lead_selection():
-    st.session_state.selected_lead_id = None
+def reset_tab_state():
+    st.session_state.selected_lead_name = None
+    st.session_state.selected_lead_hash = None
     st.session_state.view = "dashboard"
-    st.session_state.assigned_batch_hashes = []
+    st.session_state.assigned_batch_keys = []
 
 with col_tab_sel:
     tab_names = list(worksheets_dict.keys())
@@ -221,65 +265,56 @@ with col_tab_sel:
         "Active Campaign Tab", 
         tab_names, 
         key="active_keyword_tab",
-        on_change=reset_lead_selection
+        on_change=reset_tab_state
     )
     active_sheet = worksheets_dict[selected_tab_name]
 
 with col_nav2:
     if st.button("Dashboard", use_container_width=True):
         st.session_state.view = "dashboard"
-        st.session_state.selected_lead_id = None
+        st.session_state.selected_lead_name = None
+        st.session_state.selected_lead_hash = None
         st.rerun()
 
 with col_nav3:
     nav_label = "Lead Master DB" if is_admin else "My Claimed Leads"
     if st.button(nav_label, use_container_width=True):
         st.session_state.view = "database"
-        st.session_state.selected_lead_id = None
+        st.session_state.selected_lead_name = None
+        st.session_state.selected_lead_hash = None
         st.rerun()
 
 if is_admin:
     with col_nav4:
         if st.button("Rep Analytics", use_container_width=True):
             st.session_state.view = "analytics"
-            st.session_state.selected_lead_id = None
+            st.session_state.selected_lead_name = None
+            st.session_state.selected_lead_hash = None
             st.rerun()
 
 st.divider()
 
 # Load Data for Active Tab
 try:
-    df_raw = load_tab_data(active_sheet)
+    df_master = load_tab_data(active_sheet, selected_tab_name)
 except Exception as e:
     st.error(f"Could not load tab data: {e}")
     st.stop()
 
-if df_raw.empty and st.session_state.view != "analytics":
+if df_master.empty and st.session_state.view != "analytics":
     st.warning(f"No records found in campaign tab '{selected_tab_name}'.")
     st.stop()
-
-# Scoring & Preparation with positional index reset
-if not df_raw.empty:
-    scores_list = [engine.calculate_scores(row.to_dict()) for _, row in df_raw.iterrows()]
-    scores_df = pd.DataFrame(scores_list, index=df_raw.index)
-    
-    cols_to_drop = [c for c in ['opportunity_score', 'lead_tier', 'platinum_raw', 'priority_level', 'infra_deficiency', 'tracking_deficiency'] if c in df_raw.columns]
-    df_clean = df_raw.drop(columns=cols_to_drop).reset_index(drop=True)
-    scores_df = scores_df.reset_index(drop=True)
-    df_master = pd.concat([df_clean, scores_df], axis=1)
-else:
-    df_master = pd.DataFrame()
 
 def generate_fresh_batch(df_pool):
     unclaimed = df_pool[df_pool['assigned_to'].isin(['', 'Unassigned', None])]
     if unclaimed.empty:
         return []
     sample_size = min(10, len(unclaimed))
-    return unclaimed.sample(n=sample_size)['Record_Hash'].tolist()
+    return unclaimed.sample(n=sample_size)['_lead_unique_key'].tolist()
 
 if not is_admin:
-    if not st.session_state.assigned_batch_hashes and not df_master.empty:
-        st.session_state.assigned_batch_hashes = generate_fresh_batch(df_master)
+    if not st.session_state.assigned_batch_keys and not df_master.empty:
+        st.session_state.assigned_batch_keys = generate_fresh_batch(df_master)
 
 # --- VIEW 1: DASHBOARD ---
 if st.session_state.view == "dashboard":
@@ -305,9 +340,10 @@ if st.session_state.view == "dashboard":
                     c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
                     c1.markdown(f"**{row.get('Name', 'Unnamed Business')}**\n*{row.get('Location', '')} ({row.get('City', '')})*")
                     c2.markdown(f"**Assigned Rep:** `{row.get('assigned_to', 'Unassigned')}`\n*Due Date: {row.get('next_followup')}*")
-                    c3.markdown(f"**Status:** `{row.get('crm_status')}`\n*Notes: {str(row.get('notes', ''))[:45]}...*")
+                    c3.markdown(f"**Status:** `{row.get('crm_status') or 'NEW'}`\n*Notes: {str(row.get('notes', ''))[:45]}...*")
                     if c4.button("Open", key=f"due_admin_{idx}"):
-                        st.session_state.selected_lead_id = row.get('Record_Hash')
+                        st.session_state.selected_lead_name = row.get("Name")
+                        st.session_state.selected_lead_hash = row.get("Record_Hash")
                         st.session_state.view = "lead_profile"
                         st.rerun()
                     st.divider()
@@ -322,7 +358,8 @@ if st.session_state.view == "dashboard":
             c1.markdown(f"**{row.get('Name', 'Unnamed Business')}**\n*{row.get('Location', '')}, {row.get('City', '')}*")
             c2.markdown(f"**Opp Score: {row.get('opportunity_score', 100)} / 100**\n`Assigned: {assigned_text}`")
             if c3.button("Inspect", key=f"admin_lead_{idx}"):
-                st.session_state.selected_lead_id = row.get('Record_Hash')
+                st.session_state.selected_lead_name = row.get("Name")
+                st.session_state.selected_lead_hash = row.get("Record_Hash")
                 st.session_state.view = "lead_profile"
                 st.rerun()
             st.divider()
@@ -346,9 +383,10 @@ if st.session_state.view == "dashboard":
                     c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
                     c1.markdown(f"**{row.get('Name', 'Unnamed Business')}**\n*{row.get('Location', '')} ({row.get('City', '')})*")
                     c2.markdown(f"**Opp Score:** `{row.get('opportunity_score', 100)} / 100`\n*Target: {row.get('next_followup')}*")
-                    c3.markdown(f"**Status:** `{row.get('crm_status')}`\n*Notes: {str(row.get('notes', ''))[:40]}...*")
+                    c3.markdown(f"**Status:** `{row.get('crm_status') or 'NEW'}`\n*Notes: {str(row.get('notes', ''))[:40]}...*")
                     if c4.button("Call Now", key=f"due_rep_{idx}", type="primary"):
-                        st.session_state.selected_lead_id = row.get('Record_Hash')
+                        st.session_state.selected_lead_name = row.get("Name")
+                        st.session_state.selected_lead_hash = row.get("Record_Hash")
                         st.session_state.view = "lead_profile"
                         st.rerun()
                     st.divider()
@@ -361,10 +399,10 @@ if st.session_state.view == "dashboard":
         
         with col_shuffle:
             if st.button("Shuffle & Deal 10 New Leads", type="primary", use_container_width=True):
-                st.session_state.assigned_batch_hashes = generate_fresh_batch(df_master)
+                st.session_state.assigned_batch_keys = generate_fresh_batch(df_master)
                 st.rerun()
 
-        batch_df = df_master[df_master['Record_Hash'].isin(st.session_state.assigned_batch_hashes)]
+        batch_df = df_master[df_master['_lead_unique_key'].isin(st.session_state.assigned_batch_keys)]
         
         if batch_df.empty:
             st.info("No unclaimed leads remaining in this campaign tab. Click 'Shuffle' or select another campaign.")
@@ -380,7 +418,8 @@ if st.session_state.view == "dashboard":
                     if is_claimed_by_me:
                         c3.markdown("`CLAIMED BY YOU`")
                         if c4.button("Open", key=f"open_deck_{idx}"):
-                            st.session_state.selected_lead_id = row.get('Record_Hash')
+                            st.session_state.selected_lead_name = row.get("Name")
+                            st.session_state.selected_lead_hash = row.get("Record_Hash")
                             st.session_state.view = "lead_profile"
                             st.rerun()
                     else:
@@ -390,17 +429,19 @@ if st.session_state.view == "dashboard":
                                 'assigned_to': current_user, 
                                 'crm_status': 'CLAIMED'
                             })
-                            st.session_state.selected_lead_id = row.get('Record_Hash')
+                            st.session_state.selected_lead_name = row.get("Name")
+                            st.session_state.selected_lead_hash = row.get("Record_Hash")
                             st.session_state.view = "lead_profile"
                             st.rerun()
                         
                         if c4.button("Inspect", key=f"inspect_deck_{idx}"):
-                            st.session_state.selected_lead_id = row.get('Record_Hash')
+                            st.session_state.selected_lead_name = row.get("Name")
+                            st.session_state.selected_lead_hash = row.get("Record_Hash")
                             st.session_state.view = "lead_profile"
                             st.rerun()
                     st.divider()
 
-# --- VIEW 2: DIRECTORY / MY LEADS DATABASE & CSV EXPORT ---
+# --- VIEW 2: DIRECTORY / MY LEADS DATABASE & SEARCH ENGINE ---
 elif st.session_state.view == "database":
     if is_admin:
         st.subheader(f"Master Lead Database — {selected_tab_name}")
@@ -409,33 +450,43 @@ elif st.session_state.view == "database":
         st.subheader(f"My Claimed Leads Workspace — {selected_tab_name}")
         filtered_df = df_master[df_master['assigned_to'] == current_user].copy()
 
-    with st.expander("Filter and Segment Records", expanded=True):
+    with st.expander("Search, Filter, and Sort Records", expanded=True):
         f1, f2, f3 = st.columns(3)
-        search_term = f1.text_input("Search Business, Locality, or Phone")
-        city_options = sorted([str(c) for c in filtered_df['City'].unique() if c])
-        city_filter = f2.multiselect("City Filter", options=city_options)
+        search_query = f1.text_input("Live Search (Name, Phone, Locality)", value="", key="search_box").strip()
         
-        tier_options = sorted([str(t) for t in filtered_df['lead_tier'].unique() if t])
-        tier_filter = f3.multiselect("Opportunity Tier", options=tier_options)
+        city_options = sorted([str(c) for c in filtered_df['City'].unique() if str(c).strip()])
+        city_filter = f2.multiselect("Filter by City", options=city_options)
+        
+        tier_options = sorted([str(t) for t in filtered_df['lead_tier'].unique() if str(t).strip()])
+        tier_filter = f3.multiselect("Filter by Opportunity Tier", options=tier_options)
 
-        f4, f5 = st.columns(2)
+        f4, f5, f6 = st.columns(3)
         min_opp_score = f4.slider("Minimum Opportunity Score", 0, 100, 0)
+        
+        sort_by = f5.selectbox(
+            "Sort Order",
+            ["Highest Opportunity Score", "Lowest Opportunity Score", "Business Name (A-Z)", "City (A-Z)"]
+        )
         
         if is_admin:
             status_filter_options = ["All Records", "Unassigned Only", "Claimed Only"]
-            assignment_selection = f5.selectbox("Assignment Scope", status_filter_options)
+            assignment_selection = f6.selectbox("Assignment Scope", status_filter_options)
         else:
             assignment_selection = "All Records"
 
-    if search_term:
+    if search_query:
+        s = search_query.lower()
         filtered_df = filtered_df[
-            filtered_df['Name'].astype(str).str.contains(search_term, case=False, na=False) |
-            filtered_df['Location'].astype(str).str.contains(search_term, case=False, na=False) |
-            filtered_df['City'].astype(str).str.contains(search_term, case=False, na=False) |
-            filtered_df['Phone_E164'].astype(str).str.contains(search_term, na=False)
+            filtered_df['Name'].astype(str).str.lower().str.contains(s, na=False) |
+            filtered_df['Location'].astype(str).str.lower().str.contains(s, na=False) |
+            filtered_df['City'].astype(str).str.lower().str.contains(s, na=False) |
+            filtered_df['Phone_E164'].astype(str).str.contains(s, na=False) |
+            filtered_df['Website'].astype(str).str.lower().str.contains(s, na=False)
         ]
+
     if city_filter:
         filtered_df = filtered_df[filtered_df['City'].astype(str).isin(city_filter)]
+
     if tier_filter:
         filtered_df = filtered_df[filtered_df['lead_tier'].astype(str).isin(tier_filter)]
     
@@ -447,13 +498,22 @@ elif st.session_state.view == "database":
         elif assignment_selection == "Claimed Only":
             filtered_df = filtered_df[~filtered_df['assigned_to'].isin(['', 'Unassigned', None])]
 
+    if sort_by == "Highest Opportunity Score":
+        filtered_df = filtered_df.sort_values(by="opportunity_score", ascending=False)
+    elif sort_by == "Lowest Opportunity Score":
+        filtered_df = filtered_df.sort_values(by="opportunity_score", ascending=True)
+    elif sort_by == "Business Name (A-Z)":
+        filtered_df = filtered_df.sort_values(by="Name", ascending=True)
+    elif sort_by == "City (A-Z)":
+        filtered_df = filtered_df.sort_values(by="City", ascending=True)
+
     head_count_col, export_col = st.columns([3, 1])
     with head_count_col:
         st.markdown(f"**Records Displayed: {len(filtered_df)}**")
 
     if is_admin and not filtered_df.empty:
         with export_col:
-            export_data = filtered_df.drop(columns=['_sheet_row_num'], errors='ignore')
+            export_data = filtered_df.drop(columns=['_sheet_row_num', '_lead_unique_key', '_sheet_tab_name'], errors='ignore')
             csv_payload = export_data.to_csv(index=False).encode('utf-8')
             timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
             export_filename = f"leads_{selected_tab_name.lower().replace(' ', '_')}_{timestamp_str}.csv"
@@ -466,12 +526,10 @@ elif st.session_state.view == "database":
             )
 
     if filtered_df.empty:
-        if not is_admin:
-            st.info("You have not claimed any leads in this tab yet. Go to the Dashboard to review and claim leads from your 10-lead deck.")
-        else:
-            st.info("No matching records found.")
+        st.info("No matching records found.")
     else:
-        for idx, row in filtered_df.iterrows():
+        display_subset = filtered_df.head(50)
+        for idx, row in display_subset.iterrows():
             cols = st.columns([2, 3, 2, 1.5, 1.5, 1])
             assigned_badge = f"Claimed ({row.get('assigned_to')})" if row.get('assigned_to') else "Unassigned"
             cols[0].write(f"`{assigned_badge}`")
@@ -480,26 +538,35 @@ elif st.session_state.view == "database":
             cols[3].write(f"Opp: **{row.get('opportunity_score', 100)}**")
             cols[4].write(f"Status: `{row.get('crm_status') or 'NEW'}`")
             if cols[5].button("Open", key=f"db_lead_{idx}"):
-                st.session_state.selected_lead_id = row.get('Record_Hash')
+                st.session_state.selected_lead_name = row.get("Name")
+                st.session_state.selected_lead_hash = row.get("Record_Hash")
                 st.session_state.view = "lead_profile"
                 st.rerun()
 
 # --- VIEW 3: LEAD PROFILE & DIALER WORKSPACE ---
 elif st.session_state.view == "lead_profile":
-    lead_id = st.session_state.selected_lead_id
-    lead_matches = df_master[df_master['Record_Hash'].astype(str) == str(lead_id)]
-    
+    target_name = st.session_state.get("selected_lead_name")
+    target_hash = st.session_state.get("selected_lead_hash")
+
+    # Match strictly on BOTH Name and Hash
+    lead_matches = df_master[
+        (df_master["Name"] == target_name) & 
+        (df_master["Record_Hash"] == target_hash)
+    ]
+
+    # Fallback to Name if Hash was modified
     if lead_matches.empty:
-        st.warning("Lead profile not found.")
-        if st.button("Return to Dashboard"):
-            st.session_state.selected_lead_id = None
+        lead_matches = df_master[df_master["Name"] == target_name]
+
+    if lead_matches.empty:
+        st.error(f"Lead '{target_name}' not found.")
+        if st.button("Back to Dashboard"):
             st.session_state.view = "dashboard"
             st.rerun()
         st.stop()
 
-    lead_row_idx = lead_matches.index[0]
-    lead = df_master.iloc[lead_row_idx].to_dict()
-    sheet_row_num = int(lead['_sheet_row_num'])
+    lead = lead_matches.iloc[0].to_dict()
+    sheet_row_num = int(lead.get('_sheet_row_num', 2))
     assigned_rep = lead.get('assigned_to', '')
     is_claimed_by_me = (assigned_rep == current_user)
     is_unclaimed = (assigned_rep in ['', 'Unassigned', None])
@@ -509,12 +576,10 @@ elif st.session_state.view == "lead_profile":
     nav_back_target = "database" if is_claimed_by_me else "dashboard"
     st.button(f"Back to {nav_back_target.capitalize()}", on_click=lambda: setattr(st.session_state, 'view', nav_back_target))
 
-    network_text = brief.get('network_scope') or f"{lead.get('Network_Footprint', 'Single Location')} ({lead.get('Entity_Resolution_Type', 'Independent')})"
-
     head_col1, head_col2 = st.columns([3, 1])
     with head_col1:
         st.title(lead.get('Name', 'Unnamed Business'))
-        st.caption(f"{lead.get('Location', '')} · {lead.get('City', '')} · {network_text}")
+        st.caption(f"{lead.get('Location', '')} · {lead.get('City', '')} · {brief.get('network_scope', '')}")
     with head_col2:
         if is_claimed_by_me:
             st.success(f"Claimed by You ({st.session_state.user_display_name})")
@@ -532,64 +597,69 @@ elif st.session_state.view == "lead_profile":
 
     with col_left:
         st.markdown("#### Diagnostic Summary")
-        category_title = brief.get('category_title', 'Standard Digital Profile')
-        st.info(f"**Classification:** {category_title}")
+        tier_title = lead.get("Lead_Tier") or brief.get("category_title", "Standard Profile")
+        st.info(f"**Classification:** {tier_title}")
 
         st.markdown("#### Identified Pain Points & Commercial Leaks")
-        pain_points = brief.get('pain_points', [])
-        if pain_points:
-            for p in pain_points:
+        pain_triggers = lead.get("Audit_Triggers") or lead.get("Client_Pain_Point")
+        if pain_triggers:
+            for p in str(pain_triggers).split("|"):
+                if p.strip():
+                    st.markdown(f"- {p.strip()}")
+        else:
+            for p in brief.get("pain_points", []):
                 st.markdown(f"- {p}")
-        else:
-            for w in brief.get('why_points', ['Digital deficiency identified across technical parameters.']):
-                st.markdown(f"- {w}")
 
-        pkg_name = brief.get('package_name') or brief.get('service_recommendation', 'Turnkey Web Optimization')
-        st.markdown(f"#### Recommended Package: {pkg_name}")
-        
-        pkg_scope = brief.get('package_scope', [])
-        if pkg_scope:
-            for scope_item in pkg_scope:
-                st.markdown(f"- {scope_item}")
-        else:
-            st.write(pkg_name)
+        st.markdown(f"#### Recommended Package: {lead.get('Primary_Pitch_Strategy') or brief.get('package_name')}")
+        for scope_item in brief.get("package_scope", []):
+            st.markdown(f"- {scope_item}")
 
-        closer_hook = brief.get('closer_hook') or brief.get('sales_angle', '')
-        if closer_hook:
-            st.markdown("#### Core Pitch Angle")
-            st.write(closer_hook)
+        st.markdown("#### Core Pitch Angle")
+        st.write(lead.get("Client_Pain_Point") or brief.get("closer_hook"))
 
-        objections = brief.get('objections', [])
-        if objections:
-            with st.expander("Objection Handling Battlecards", expanded=False):
-                for obj in objections:
-                    st.markdown(f"**Prospect:** \"{obj.get('objection')}\"")
-                    st.markdown(f"**Your Rebuttal:** {obj.get('rebuttal')}")
-                    st.write("---")
+        with st.expander("Objection Handling Battlecards", expanded=False):
+            for obj in brief.get("objections", []):
+                st.markdown(f"**Prospect:** \"{obj.get('objection')}\"")
+                st.markdown(f"**Your Rebuttal:** {obj.get('rebuttal')}")
+                st.write("---")
 
-        # HTML Scorecard Preview
-        record_hash = str(lead.get('Record_Hash', '')).strip()
-        html_report_path = os.path.join("audit_reports_html", f"{record_hash}.html")
-        if os.path.exists(html_report_path):
+        # --- EMBEDDED HTML AUDIT SCORECARD PREVIEW ---
+        html_file_name = str(lead.get("HTML_Scorecard_File", "")).strip()
+        record_hash = str(lead.get("Record_Hash", "")).strip()
+
+        html_path = None
+        if html_file_name:
+            candidate = os.path.join("audit_reports_html", html_file_name)
+            if os.path.exists(candidate):
+                html_path = candidate
+
+        # Fallback to hash-based filename
+        if not html_path and record_hash:
+            candidate_hash = os.path.join("audit_reports_html", f"{record_hash}.html")
+            if os.path.exists(candidate_hash):
+                html_path = candidate_hash
+
+        if html_path and os.path.exists(html_path):
             st.markdown("#### Generated Audit Scorecard")
-            with open(html_report_path, "r", encoding="utf-8") as f:
+            with open(html_path, "r", encoding="utf-8") as f:
                 html_content = f.read()
-            st.components.v1.html(html_content, height=400, scrolling=True)
+            st.components.v1.html(html_content, height=450, scrolling=True)
 
     with col_right:
         st.markdown("#### Action Triggers & Dialing")
-        
-        phone_num = str(lead.get('Phone_E164', 'N/A'))
+        phone_num = str(lead.get('Phone_E164', 'N/A')).strip()
         can_contact = is_admin or is_claimed_by_me
         
-        if not is_admin and not is_claimed_by_me:
+        if not can_contact:
             masked_phone = phone_num[:4] + "******" + phone_num[-2:] if len(phone_num) > 6 else "Locked"
             st.write(f"**Direct Phone:** `{masked_phone}` *(Claim lead to unlock)*")
         else:
             st.write(f"**Direct Phone:** `{phone_num}`")
 
-        raw_phone = str(lead.get('Phone_E164', '')).replace("+", "").replace(" ", "").replace("-", "")
+        raw_phone = re.sub(r'\D', '', phone_num)
         wa_link = lead.get('WhatsApp_Click_Link', '')
+        if not wa_link and raw_phone:
+            wa_link = f"https://wa.me/{raw_phone}"
 
         a1, a2 = st.columns(2)
         if can_contact and raw_phone:
@@ -600,26 +670,24 @@ elif st.session_state.view == "lead_profile":
             a2.button("WhatsApp (Claim to Unlock)", disabled=True, use_container_width=True)
 
         st.markdown("#### Ready-to-Send Outreach Script")
-        pitch_displayed = False
-        if "text=" in str(wa_link) and can_contact:
+        direct_hook = lead.get('WhatsApp_DM_Hook', '').strip()
+        if direct_hook and can_contact:
+            st.code(direct_hook, language=None)
+        elif "text=" in str(wa_link) and can_contact:
             try:
                 decoded_pitch = urllib.parse.unquote_plus(str(wa_link).split("text=")[1])
                 st.code(decoded_pitch, language=None)
-                pitch_displayed = True
             except Exception:
                 pass
-        
-        if not pitch_displayed and can_contact:
-            scenario_key = brief.get('scenario') or brief.get('pitch_type', 'GENERAL')
+        elif can_contact:
             fallback_text, _, _ = engine.get_outreach_pitch(
-                scenario_key,
                 lead.get('Name', ''),
                 selected_tab_name,
                 lead.get('City', '')
             )
             st.code(fallback_text, language=None)
 
-        # --- CALL OUTCOME QUICK-TAGS ---
+        # --- CALL OUTCOMES ---
         st.markdown("#### Quick Call Outcomes")
         if can_contact:
             q1, q2, q3 = st.columns(3)
@@ -683,41 +751,16 @@ elif st.session_state.view == "lead_profile":
                 })
                 st.warning("Tagged: Not Interested.")
                 st.rerun()
-        else:
-            st.caption("Claim this lead to enable 1-click call logging.")
 
-        st.markdown("#### Manual Activity Entry")
-        with st.form("crm_logging_form"):
-            current_status = str(lead.get('crm_status', 'NEW')).upper()
-            status_options = ['NEW', 'CLAIMED', 'CONTACTED', 'FOLLOW-UP', 'INTERESTED', 'PROPOSAL', 'WON', 'LOST']
-            default_index = status_options.index(current_status) if current_status in status_options else 0
-            
-            new_status = st.selectbox("Status", status_options, index=default_index)
-            next_date = st.date_input("Follow-up Date")
-            notes = st.text_area("Detailed Notes", value=str(lead.get('notes', '')))
-            
-            if st.form_submit_button("Save Detailed Activity"):
-                update_dict = {
-                    'crm_status': new_status,
-                    'notes': notes,
-                    'next_followup': str(next_date),
-                    'last_contacted': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    'assigned_to': current_user if is_unclaimed else assigned_rep
-                }
-                update_lead_in_sheet(active_sheet, sheet_row_num, update_dict)
-                st.success("Activity saved.")
-                st.rerun()
-
-# --- VIEW 4: ADMIN REP PERFORMANCE ANALYTICS ---
+# --- VIEW 4: ADMIN ANALYTICS ---
 elif st.session_state.view == "analytics" and is_admin:
     st.subheader("Sales Representative Performance & Pipeline Analytics")
-    st.caption("Multi-campaign aggregated metrics across all team members.")
 
     with st.spinner("Aggregating sales activity across all campaign sheets..."):
         all_leads = []
         for tab_name, sheet_obj in worksheets_dict.items():
             try:
-                sheet_df = load_tab_data(sheet_obj)
+                sheet_df = load_tab_data(sheet_obj, tab_name)
                 if not sheet_df.empty:
                     sheet_df['Campaign_Tab'] = tab_name
                     all_leads.append(sheet_df)
@@ -729,28 +772,19 @@ elif st.session_state.view == "analytics" and is_admin:
         st.stop()
 
     df_analytics = pd.concat(all_leads, ignore_index=True)
-
     claimed_mask = ~df_analytics['assigned_to'].isin(['', 'Unassigned', None])
     df_claimed = df_analytics[claimed_mask].copy()
 
-    total_pool = len(df_analytics)
-    total_claimed = len(df_claimed)
-    total_meetings = len(df_claimed[df_claimed['crm_status'].str.upper().isin(['INTERESTED', 'WON', 'PROPOSAL'])])
-    total_followups = len(df_claimed[df_claimed['crm_status'].str.upper() == 'FOLLOW-UP'])
-
     top_m1, top_m2, top_m3, top_m4 = st.columns(4)
-    top_m1.metric("Total Lead Inventory", total_pool)
-    top_m2.metric("Total Claimed Leads", total_claimed)
-    top_m3.metric("Total Meetings Booked", total_meetings)
-    top_m4.metric("Active Follow-ups", total_followups)
+    top_m1.metric("Total Lead Inventory", len(df_analytics))
+    top_m2.metric("Total Claimed Leads", len(df_claimed))
+    top_m3.metric("Total Meetings Booked", len(df_claimed[df_claimed['crm_status'].str.upper().isin(['INTERESTED', 'WON', 'PROPOSAL'])]))
+    top_m4.metric("Active Follow-ups", len(df_claimed[df_claimed['crm_status'].str.upper() == 'FOLLOW-UP']))
 
     st.divider()
-
     st.markdown("#### Rep Performance Scorecard")
 
-    if df_claimed.empty:
-        st.info("No leads have been claimed by sales representatives yet.")
-    else:
+    if not df_claimed.empty:
         rep_groups = df_claimed.groupby('assigned_to')
         scorecard_rows = []
 
@@ -774,18 +808,3 @@ elif st.session_state.view == "analytics" and is_admin:
 
         scorecard_df = pd.DataFrame(scorecard_rows).sort_values(by="Meetings Booked", ascending=False)
         st.dataframe(scorecard_df, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # Activity Timeline Feed
-    st.markdown("#### Recent Team Activity Log")
-    df_touched = df_claimed[df_claimed['last_contacted'] != ""].sort_values(by="last_contacted", ascending=False).head(15)
-
-    if df_touched.empty:
-        st.caption("No recent outreach activity logged.")
-    else:
-        for _, row in df_touched.iterrows():
-            st.markdown(f"**[{row.get('last_contacted')}]** `{row.get('assigned_to')}` updated **{row.get('Name')}** ({row.get('Campaign_Tab')}) -> Status: `{row.get('crm_status')}`")
-            if row.get('notes'):
-                st.caption(f"Notes: {row.get('notes')}")
-            st.write("---")

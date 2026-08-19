@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .vscode/
 audits_json
+populate_unique_hashes.py
