@@ -66,7 +66,7 @@ if not st.session_state.authenticated:
     login()
     st.stop()
 
-# --- OPTIMIZED GOOGLE SHEETS CONNECTION & RAM CACHING ---
+# --- OPTIMIZED GOOGLE SHEETS CONNECTION & CACHING ---
 @st.cache_resource(ttl=3600)
 def get_gspread_client():
     scope = [
@@ -95,32 +95,11 @@ def col_idx_to_a1(idx: int) -> str:
         letters = chr(65 + remainder) + letters
     return letters
 
-# Cache tab data in RAM for 600s with Exponential Backoff Retry
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
-    client = get_gspread_client()
-    spreadsheet = client.open_by_url(sheet_url)
-    
-    raw_rows = None
-    max_retries = 4
-    for attempt in range(max_retries):
-        try:
-            sheet = spreadsheet.worksheet(tab_name)
-            raw_rows = sheet.get_all_values()
-            break
-        except Exception as e:
-            if "429" in str(e) or "Quota exceeded" in str(e):
-                wait_time = (attempt + 1) * 3  # Wait 3s, 6s, 9s...
-                time.sleep(wait_time)
-                if attempt == max_retries - 1:
-                    raise e
-            else:
-                raise e
-    
+def parse_raw_rows_to_dataframe(raw_rows: list, tab_name: str) -> pd.DataFrame:
+    """Parses raw row lists into structured DataFrame with zero network overhead."""
     if not raw_rows or len(raw_rows) < 2:
         return pd.DataFrame()
 
-    # Dynamic Header Detection (scans up to row 5)
     header_row_idx = 0
     for idx, r in enumerate(raw_rows[:5]):
         cleaned = [str(c).strip().lower() for c in r if str(c).strip()]
@@ -134,7 +113,6 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
 
     records = []
     for offset, r in enumerate(data_rows):
-        # Retain row as long as ANY cell contains valid data
         if not any(bool(str(c).strip()) for c in r):
             continue
 
@@ -180,7 +158,6 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
             "Network_Footprint": get_field('Network_Footprint', 'network_footprint', default="Single Location"),
             "Entity_Resolution_Type": get_field('Entity_Resolution_Type', 'entity_resolution_type', default="Independent"),
             
-            # Scraped Rich Copy
             "Audit_Triggers": get_field('Audit_Triggers', 'audit_triggers', default=""),
             "Primary_Pitch_Strategy": get_field('Primary_Pitch_Strategy', 'primary_pitch_strategy', default=""),
             "Client_Pain_Point": get_field('Client_Pain_Point', 'client_pain_point', default=""),
@@ -189,7 +166,6 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
             "Competitor_Comparison_Hook": get_field('Competitor_Comparison_Hook', 'competitor_comparison_hook', default=""),
             "HTML_Scorecard_File": get_field('HTML_Scorecard_File', 'html_scorecard_file', default=""),
             
-            # CRM Tracking Fields
             "crm_status": get_field('crm_status', default=""),
             "notes": get_field('notes', default=""),
             "next_followup": get_field('next_followup', default=""),
@@ -205,6 +181,41 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     return pd.DataFrame(records).reset_index(drop=True)
+
+# 1 Single API call to batch-fetch all sheets at once
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_all_tabs_batch(sheet_url: str, tab_names_list: tuple) -> dict:
+    client = get_gspread_client()
+    spreadsheet = client.open_by_url(sheet_url)
+    
+    # Format ranges: 'Tab Name'!A1:ZZ5000
+    ranges = [f"'{t}'!A1:ZZ5000" for t in tab_names_list]
+    
+    # 1 Single Batch HTTP Request across all 34 tabs
+    max_retries = 3
+    result_data = None
+    for attempt in range(max_retries):
+        try:
+            result_data = spreadsheet.values_batch_get(ranges)
+            break
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep((attempt + 1) * 5)
+            else:
+                raise e
+
+    if not result_data or "valueRanges" not in result_data:
+        return {}
+
+    parsed_dict = {}
+    for idx, t_name in enumerate(tab_names_list):
+        if idx < len(result_data["valueRanges"]):
+            raw_vals = result_data["valueRanges"][idx].get("values", [])
+            parsed_dict[t_name] = parse_raw_rows_to_dataframe(raw_vals, t_name)
+        else:
+            parsed_dict[t_name] = pd.DataFrame()
+
+    return parsed_dict
 
 def update_lead_in_sheet(spreadsheet, tab_name: str, exact_sheet_row: int, update_dict: dict):
     sheet = spreadsheet.worksheet(tab_name)
@@ -238,8 +249,8 @@ def update_lead_in_sheet(spreadsheet, tab_name: str, exact_sheet_row: int, updat
     except TypeError:
         sheet.update(range_update, [current_row_values])
     
-    # Invalidate cache so modifications load immediately
-    fetch_cached_tab_data.clear()
+    # Invalidate cache so changes appear immediately
+    fetch_all_tabs_batch.clear()
 
 # Session state initialization
 if "view" not in st.session_state:
@@ -263,7 +274,7 @@ st.sidebar.markdown(f"**User:** {st.session_state.user_display_name}")
 st.sidebar.caption(f"Role: **{st.session_state.user_role.upper()}**")
 
 if st.sidebar.button("🔄 Refresh Data Cache", use_container_width=True):
-    fetch_cached_tab_data.clear()
+    fetch_all_tabs_batch.clear()
     st.toast("Data cache refreshed!")
     st.rerun()
 
@@ -328,9 +339,10 @@ if is_admin:
 
 st.divider()
 
-# Load Tab Data instantly from RAM cache
+# Load all 34 tabs in 1 single HTTP request
 try:
-    df_master = fetch_cached_tab_data(sheet_url, selected_tab_name)
+    all_tabs_dict = fetch_all_tabs_batch(sheet_url, tuple(tab_names))
+    df_master = all_tabs_dict.get(selected_tab_name, pd.DataFrame())
 except Exception as e:
     st.error(f"Could not load tab data: {e}")
     st.stop()
@@ -787,23 +799,13 @@ elif st.session_state.view == "lead_profile":
 elif st.session_state.view == "analytics" and is_admin:
     st.subheader("Sales Representative Performance & Pipeline Analytics")
 
-    with st.spinner("Aggregating sales activity across all 34 campaign sheets..."):
-        all_leads = []
-        progress_bar = st.progress(0)
-        
-        for i, t_name in enumerate(tab_names):
-            try:
-                sheet_df = fetch_cached_tab_data(sheet_url, t_name)
-                if not sheet_df.empty:
-                    sheet_df['Campaign_Tab'] = t_name
-                    all_leads.append(sheet_df)
-            except Exception as tab_err:
-                st.warning(f"Tab '{t_name}' could not be loaded: {tab_err}")
-            
-            progress_bar.progress((i + 1) / len(tab_names))
-            time.sleep(0.3)  # Gentle pacing to avoid Google 60 req/min limit
-
-        progress_bar.empty()
+    # Combine all tabs instantly from the single in-memory batch dictionary
+    all_leads = []
+    for t_name, df_tab in all_tabs_dict.items():
+        if not df_tab.empty:
+            df_tab_copy = df_tab.copy()
+            df_tab_copy['Campaign_Tab'] = t_name
+            all_leads.append(df_tab_copy)
 
     if not all_leads:
         st.warning("No campaign lead data available to analyze.")
