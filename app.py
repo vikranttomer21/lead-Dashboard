@@ -10,7 +10,7 @@ import engine
 
 st.set_page_config(page_title="Sales Intelligence CRM", layout="wide")
 
-# Styling
+# Custom Clean Styling
 st.markdown("""
 <style>
     .metric-card {
@@ -65,7 +65,8 @@ if not st.session_state.authenticated:
     login()
     st.stop()
 
-# --- GOOGLE SHEETS CONNECTION ---
+# --- OPTIMIZED GOOGLE SHEETS CONNECTION & CACHING ---
+@st.cache_resource(ttl=3600)
 def get_gspread_client():
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -78,12 +79,13 @@ def get_gspread_client():
     credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(credentials)
 
-def get_all_worksheets():
+@st.cache_resource(ttl=600)
+def get_spreadsheet_and_titles():
     client = get_gspread_client()
     sheet_url = st.secrets["spreadsheet"]["sheet_url"]
     spreadsheet = client.open_by_url(sheet_url)
-    worksheets = {ws.title.strip(): ws for ws in spreadsheet.worksheets()}
-    return worksheets, spreadsheet
+    titles = [ws.title.strip() for ws in spreadsheet.worksheets()]
+    return spreadsheet, titles
 
 def col_idx_to_a1(idx: int) -> str:
     letters = ""
@@ -92,11 +94,14 @@ def col_idx_to_a1(idx: int) -> str:
         letters = chr(65 + remainder) + letters
     return letters
 
-def load_tab_data(sheet, tab_name: str):
-    """
-    Direct Header-Zip: Zips Row 1 headers with each row cell, preventing offset shifts.
-    """
+# Cache tab data in RAM for 120s (instant UI response)
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
+    client = get_gspread_client()
+    spreadsheet = client.open_by_url(sheet_url)
+    sheet = spreadsheet.worksheet(tab_name)
     raw_rows = sheet.get_all_values()
+    
     if not raw_rows or len(raw_rows) < 2:
         return pd.DataFrame()
 
@@ -127,12 +132,10 @@ def load_tab_data(sheet, tab_name: str):
                         return v
             return default
 
-        # Clean Phone Number directly from Phone_E164
         phone_raw = get_field('Phone_E164', 'Phone', 'phone', 'Contact', default="")
         phone_cleaned = re.sub(r'[^\d+]', '', phone_raw)
         wa_link = get_field('WhatsApp_Click_Link', 'whatsapp_click_link', 'wa_link', default="")
         
-        # Only fall back to extracting from WhatsApp Link if phone is truly empty
         if not phone_cleaned and "wa.me/" in wa_link:
             m = re.search(r'wa\.me/(\d+)', wa_link)
             if m:
@@ -159,7 +162,6 @@ def load_tab_data(sheet, tab_name: str):
             "Network_Footprint": get_field('Network_Footprint', 'network_footprint', default="Single Location"),
             "Entity_Resolution_Type": get_field('Entity_Resolution_Type', 'entity_resolution_type', default="Independent"),
             
-            # Scraped Rich Copy
             "Audit_Triggers": get_field('Audit_Triggers', 'audit_triggers', default=""),
             "Primary_Pitch_Strategy": get_field('Primary_Pitch_Strategy', 'primary_pitch_strategy', default=""),
             "Client_Pain_Point": get_field('Client_Pain_Point', 'client_pain_point', default=""),
@@ -168,7 +170,6 @@ def load_tab_data(sheet, tab_name: str):
             "Competitor_Comparison_Hook": get_field('Competitor_Comparison_Hook', 'competitor_comparison_hook', default=""),
             "HTML_Scorecard_File": get_field('HTML_Scorecard_File', 'html_scorecard_file', default=""),
             
-            # CRM Fields
             "crm_status": get_field('crm_status', default=""),
             "notes": get_field('notes', default=""),
             "next_followup": get_field('next_followup', default=""),
@@ -176,7 +177,6 @@ def load_tab_data(sheet, tab_name: str):
             "assigned_to": get_field('assigned_to', default=""),
         }
 
-        # Calculate opportunity score
         scores = engine.calculate_scores(row_dict)
         row_dict.update(scores)
         records.append(row_dict)
@@ -186,7 +186,8 @@ def load_tab_data(sheet, tab_name: str):
 
     return pd.DataFrame(records).reset_index(drop=True)
 
-def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
+def update_lead_in_sheet(spreadsheet, tab_name: str, exact_sheet_row: int, update_dict: dict):
+    sheet = spreadsheet.worksheet(tab_name)
     headers = [str(h).strip() for h in sheet.row_values(1)]
     header_modified = False
 
@@ -197,7 +198,7 @@ def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
 
     if header_modified:
         range_header = f"A1:{col_idx_to_a1(len(headers))}1"
-        sheet.update(range_name=range_header, values=[headers])
+        sheet.update(values=[headers], range_name=range_header)
 
     current_row_values = sheet.row_values(exact_sheet_row)
     if len(current_row_values) < len(headers):
@@ -209,7 +210,10 @@ def update_lead_in_sheet(sheet, exact_sheet_row: int, update_dict: dict):
             current_row_values[col_pos] = str(val)
 
     range_update = f"A{exact_sheet_row}:{col_idx_to_a1(len(headers))}{exact_sheet_row}"
-    sheet.update(range_name=range_update, values=[current_row_values])
+    sheet.update(values=[current_row_values], range_name=range_update)
+    
+    # Invalidate cache so fresh CRM updates show immediately
+    fetch_cached_tab_data.clear()
 
 # Session state initialization
 if "view" not in st.session_state:
@@ -222,7 +226,8 @@ if "assigned_batch_keys" not in st.session_state:
     st.session_state.assigned_batch_keys = []
 
 try:
-    worksheets_dict, spreadsheet = get_all_worksheets()
+    spreadsheet, tab_names = get_spreadsheet_and_titles()
+    sheet_url = st.secrets["spreadsheet"]["sheet_url"]
 except Exception as e:
     st.error(f"Failed to connect to Google Sheets: {e}")
     st.stop()
@@ -230,6 +235,11 @@ except Exception as e:
 # --- SIDEBAR ---
 st.sidebar.markdown(f"**User:** {st.session_state.user_display_name}")
 st.sidebar.caption(f"Role: **{st.session_state.user_role.upper()}**")
+
+if st.sidebar.button("🔄 Refresh Data Cache", use_container_width=True):
+    fetch_cached_tab_data.clear()
+    st.toast("Data cache refreshed!")
+    st.rerun()
 
 if st.sidebar.button("Log Out", use_container_width=True):
     st.session_state.authenticated = False
@@ -260,14 +270,12 @@ def reset_tab_state():
     st.session_state.assigned_batch_keys = []
 
 with col_tab_sel:
-    tab_names = list(worksheets_dict.keys())
     selected_tab_name = st.selectbox(
         "Active Campaign Tab", 
         tab_names, 
         key="active_keyword_tab",
         on_change=reset_tab_state
     )
-    active_sheet = worksheets_dict[selected_tab_name]
 
 with col_nav2:
     if st.button("Dashboard", use_container_width=True):
@@ -294,9 +302,9 @@ if is_admin:
 
 st.divider()
 
-# Load Data for Active Tab
+# Load Tab Data instantly from RAM cache
 try:
-    df_master = load_tab_data(active_sheet, selected_tab_name)
+    df_master = fetch_cached_tab_data(sheet_url, selected_tab_name)
 except Exception as e:
     st.error(f"Could not load tab data: {e}")
     st.stop()
@@ -425,7 +433,7 @@ if st.session_state.view == "dashboard":
                     else:
                         if c3.button("Claim Lead", key=f"claim_deck_{idx}", use_container_width=True):
                             sheet_row_num = int(row['_sheet_row_num'])
-                            update_lead_in_sheet(active_sheet, sheet_row_num, {
+                            update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                                 'assigned_to': current_user, 
                                 'crm_status': 'CLAIMED'
                             })
@@ -548,13 +556,11 @@ elif st.session_state.view == "lead_profile":
     target_name = st.session_state.get("selected_lead_name")
     target_hash = st.session_state.get("selected_lead_hash")
 
-    # Match strictly on BOTH Name and Hash
     lead_matches = df_master[
         (df_master["Name"] == target_name) & 
         (df_master["Record_Hash"] == target_hash)
     ]
 
-    # Fallback to Name if Hash was modified
     if lead_matches.empty:
         lead_matches = df_master[df_master["Name"] == target_name]
 
@@ -586,7 +592,7 @@ elif st.session_state.view == "lead_profile":
         elif is_unclaimed:
             st.warning("Unclaimed Lead")
             if st.button("Claim This Lead Now", type="primary", use_container_width=True):
-                update_lead_in_sheet(active_sheet, sheet_row_num, {'assigned_to': current_user, 'crm_status': 'CLAIMED'})
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {'assigned_to': current_user, 'crm_status': 'CLAIMED'})
                 st.success("Lead claimed successfully.")
                 st.rerun()
         else:
@@ -633,7 +639,6 @@ elif st.session_state.view == "lead_profile":
             if os.path.exists(candidate):
                 html_path = candidate
 
-        # Fallback to hash-based filename
         if not html_path and record_hash:
             candidate_hash = os.path.join("audit_reports_html", f"{record_hash}.html")
             if os.path.exists(candidate_hash):
@@ -695,7 +700,7 @@ elif st.session_state.view == "lead_profile":
             
             if q1.button("No Answer", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, sheet_row_num, {
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                     'crm_status': 'NO_ANSWER',
                     'notes': f"[{now_ts}] Called - No answer / Busy.",
                     'next_followup': next_date,
@@ -707,7 +712,7 @@ elif st.session_state.view == "lead_profile":
 
             if q2.button("Gatekeeper Refused", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=3)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, sheet_row_num, {
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                     'crm_status': 'GATEKEEPER_BLOCKED',
                     'notes': f"[{now_ts}] Reached reception/staff. Owner unavailable.",
                     'next_followup': next_date,
@@ -719,7 +724,7 @@ elif st.session_state.view == "lead_profile":
 
             if q3.button("Call Back Later", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, sheet_row_num, {
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                     'crm_status': 'FOLLOW-UP',
                     'notes': f"[{now_ts}] Requested callback.",
                     'next_followup': next_date,
@@ -732,7 +737,7 @@ elif st.session_state.view == "lead_profile":
             q4, q5 = st.columns(2)
             if q4.button("Meeting / Demo Booked", type="primary", use_container_width=True):
                 next_date = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                update_lead_in_sheet(active_sheet, sheet_row_num, {
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                     'crm_status': 'INTERESTED',
                     'notes': f"[{now_ts}] Meeting / Demo pitch scheduled.",
                     'next_followup': next_date,
@@ -743,7 +748,7 @@ elif st.session_state.view == "lead_profile":
                 st.rerun()
 
             if q5.button("Not Interested / Lost", use_container_width=True):
-                update_lead_in_sheet(active_sheet, sheet_row_num, {
+                update_lead_in_sheet(spreadsheet, selected_tab_name, sheet_row_num, {
                     'crm_status': 'LOST',
                     'notes': f"[{now_ts}] Lead declined offer.",
                     'last_contacted': now_ts,
@@ -758,11 +763,11 @@ elif st.session_state.view == "analytics" and is_admin:
 
     with st.spinner("Aggregating sales activity across all campaign sheets..."):
         all_leads = []
-        for tab_name, sheet_obj in worksheets_dict.items():
+        for t_name in tab_names:
             try:
-                sheet_df = load_tab_data(sheet_obj, tab_name)
+                sheet_df = fetch_cached_tab_data(sheet_url, t_name)
                 if not sheet_df.empty:
-                    sheet_df['Campaign_Tab'] = tab_name
+                    sheet_df['Campaign_Tab'] = t_name
                     all_leads.append(sheet_df)
             except Exception:
                 continue
