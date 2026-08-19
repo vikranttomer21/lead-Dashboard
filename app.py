@@ -65,7 +65,7 @@ if not st.session_state.authenticated:
     login()
     st.stop()
 
-# --- OPTIMIZED GOOGLE SHEETS CONNECTION & CACHING ---
+# --- OPTIMIZED GOOGLE SHEETS CONNECTION & RAM CACHING ---
 @st.cache_resource(ttl=3600)
 def get_gspread_client():
     scope = [
@@ -94,8 +94,8 @@ def col_idx_to_a1(idx: int) -> str:
         letters = chr(65 + remainder) + letters
     return letters
 
-# Cache tab data in RAM for 120s (instant UI response)
-@st.cache_data(ttl=120, show_spinner=False)
+# Cache tab data in RAM for 300s (Fast UI navigation)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
     client = get_gspread_client()
     spreadsheet = client.open_by_url(sheet_url)
@@ -105,10 +105,11 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
     if not raw_rows or len(raw_rows) < 2:
         return pd.DataFrame()
 
+    # Dynamic Header Detection (scans up to row 5)
     header_row_idx = 0
     for idx, r in enumerate(raw_rows[:5]):
         cleaned = [str(c).strip().lower() for c in r if str(c).strip()]
-        if any(k in cleaned for k in ['name', 'phone_e164', 'phone', 'record_hash', 'city']):
+        if any(k in cleaned for k in ['name', 'phone_e164', 'phone', 'record_hash', 'city', 'title', 'business_name', 'locality']):
             header_row_idx = idx
             break
 
@@ -118,7 +119,8 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
 
     records = []
     for offset, r in enumerate(data_rows):
-        if not any(str(c).strip() for c in r):
+        # Retain row as long as ANY cell contains valid data
+        if not any(bool(str(c).strip()) for c in r):
             continue
 
         actual_sheet_row = header_row_idx + 2 + offset
@@ -132,7 +134,8 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
                         return v
             return default
 
-        phone_raw = get_field('Phone_E164', 'Phone', 'phone', 'Contact', default="")
+        name_val = get_field('Name', 'Business_Name', 'Title', 'Store_Name', 'name', default=f"Lead @ Row {actual_sheet_row}")
+        phone_raw = get_field('Phone_E164', 'Phone', 'phone', 'Contact', 'Mobile', default="")
         phone_cleaned = re.sub(r'[^\d+]', '', phone_raw)
         wa_link = get_field('WhatsApp_Click_Link', 'whatsapp_click_link', 'wa_link', default="")
         
@@ -150,8 +153,8 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
             "Record_Hash": get_field('Record_Hash', 'record_hash', default=f"HASH_{actual_sheet_row}"),
             "Lead_Tier": get_field('Lead_Tier', 'lead_tier', default=""),
             "Platinum_Score": get_field('Platinum_Score', 'platinum_score', default="0"),
-            "Name": get_field('Name', 'Business_Name', 'name', default=f"Business @ Row {actual_sheet_row}"),
-            "Location": get_field('Location', 'Address', 'locality', default=""),
+            "Name": name_val,
+            "Location": get_field('Location', 'Address', 'locality', 'Locality', default=""),
             "City": get_field('City', 'city', default=""),
             "Phone_E164": phone_cleaned,
             "WhatsApp_Click_Link": wa_link,
@@ -162,6 +165,7 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
             "Network_Footprint": get_field('Network_Footprint', 'network_footprint', default="Single Location"),
             "Entity_Resolution_Type": get_field('Entity_Resolution_Type', 'entity_resolution_type', default="Independent"),
             
+            # Scraped Rich Copy
             "Audit_Triggers": get_field('Audit_Triggers', 'audit_triggers', default=""),
             "Primary_Pitch_Strategy": get_field('Primary_Pitch_Strategy', 'primary_pitch_strategy', default=""),
             "Client_Pain_Point": get_field('Client_Pain_Point', 'client_pain_point', default=""),
@@ -170,6 +174,7 @@ def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
             "Competitor_Comparison_Hook": get_field('Competitor_Comparison_Hook', 'competitor_comparison_hook', default=""),
             "HTML_Scorecard_File": get_field('HTML_Scorecard_File', 'html_scorecard_file', default=""),
             
+            # CRM Tracking Fields
             "crm_status": get_field('crm_status', default=""),
             "notes": get_field('notes', default=""),
             "next_followup": get_field('next_followup', default=""),
@@ -198,7 +203,10 @@ def update_lead_in_sheet(spreadsheet, tab_name: str, exact_sheet_row: int, updat
 
     if header_modified:
         range_header = f"A1:{col_idx_to_a1(len(headers))}1"
-        sheet.update(values=[headers], range_name=range_header)
+        try:
+            sheet.update(values=[headers], range_name=range_header)
+        except TypeError:
+            sheet.update(range_header, [headers])
 
     current_row_values = sheet.row_values(exact_sheet_row)
     if len(current_row_values) < len(headers):
@@ -210,9 +218,12 @@ def update_lead_in_sheet(spreadsheet, tab_name: str, exact_sheet_row: int, updat
             current_row_values[col_pos] = str(val)
 
     range_update = f"A{exact_sheet_row}:{col_idx_to_a1(len(headers))}{exact_sheet_row}"
-    sheet.update(values=[current_row_values], range_name=range_update)
+    try:
+        sheet.update(values=[current_row_values], range_name=range_update)
+    except TypeError:
+        sheet.update(range_update, [current_row_values])
     
-    # Invalidate cache so fresh CRM updates show immediately
+    # Invalidate cache so modifications load immediately
     fetch_cached_tab_data.clear()
 
 # Session state initialization
@@ -761,16 +772,22 @@ elif st.session_state.view == "lead_profile":
 elif st.session_state.view == "analytics" and is_admin:
     st.subheader("Sales Representative Performance & Pipeline Analytics")
 
-    with st.spinner("Aggregating sales activity across all campaign sheets..."):
+    with st.spinner("Aggregating sales activity across all 34 campaign sheets..."):
         all_leads = []
-        for t_name in tab_names:
+        progress_bar = st.progress(0)
+        
+        for i, t_name in enumerate(tab_names):
             try:
                 sheet_df = fetch_cached_tab_data(sheet_url, t_name)
                 if not sheet_df.empty:
                     sheet_df['Campaign_Tab'] = t_name
                     all_leads.append(sheet_df)
-            except Exception:
-                continue
+            except Exception as tab_err:
+                st.warning(f"Tab '{t_name}' could not be loaded: {tab_err}")
+            
+            progress_bar.progress((i + 1) / len(tab_names))
+
+        progress_bar.empty()
 
     if not all_leads:
         st.warning("No campaign lead data available to analyze.")

@@ -114,7 +114,7 @@ class SalesIntelligenceEngine:
             "⭐ Automated 5-Star Customer Review Collector"
         ]
 
-        # 3. Simple Core Pitch Angle (What the salesperson should say)
+        # 3. Simple Core Pitch Angle
         if "social" in scraped_tier.lower() or "instagram" in str(simplified_pain_points).lower():
             closer_hook = f"When customers look up {business_name}, sending them to an Instagram link loses orders. A dedicated 1-click WhatsApp storefront captures direct customers instantly without aggregator cuts."
         elif "broken" in scraped_tier.lower() or "broken" in str(simplified_pain_points).lower():
@@ -124,7 +124,7 @@ class SalesIntelligenceEngine:
         else:
             closer_hook = f"Position {business_name} as the top-ranking choice in {location} with automated booking and local Google Maps optimization."
 
-        # 4. Realistic Everyday Sales Objections & Comebacks
+        # 4. Realistic Sales Objections & Comebacks
         objections = [
             {
                 "objection": "We already get enough business through word-of-mouth or Instagram.",
