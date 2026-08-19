@@ -6,6 +6,7 @@ import urllib.parse
 import os
 import datetime
 import re
+import time
 import engine
 
 st.set_page_config(page_title="Sales Intelligence CRM", layout="wide")
@@ -94,13 +95,27 @@ def col_idx_to_a1(idx: int) -> str:
         letters = chr(65 + remainder) + letters
     return letters
 
-# Cache tab data in RAM for 300s (Fast UI navigation)
-@st.cache_data(ttl=300, show_spinner=False)
+# Cache tab data in RAM for 600s with Exponential Backoff Retry
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_cached_tab_data(sheet_url: str, tab_name: str) -> pd.DataFrame:
     client = get_gspread_client()
     spreadsheet = client.open_by_url(sheet_url)
-    sheet = spreadsheet.worksheet(tab_name)
-    raw_rows = sheet.get_all_values()
+    
+    raw_rows = None
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            sheet = spreadsheet.worksheet(tab_name)
+            raw_rows = sheet.get_all_values()
+            break
+        except Exception as e:
+            if "429" in str(e) or "Quota exceeded" in str(e):
+                wait_time = (attempt + 1) * 3  # Wait 3s, 6s, 9s...
+                time.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    raise e
+            else:
+                raise e
     
     if not raw_rows or len(raw_rows) < 2:
         return pd.DataFrame()
@@ -786,6 +801,7 @@ elif st.session_state.view == "analytics" and is_admin:
                 st.warning(f"Tab '{t_name}' could not be loaded: {tab_err}")
             
             progress_bar.progress((i + 1) / len(tab_names))
+            time.sleep(0.3)  # Gentle pacing to avoid Google 60 req/min limit
 
         progress_bar.empty()
 
